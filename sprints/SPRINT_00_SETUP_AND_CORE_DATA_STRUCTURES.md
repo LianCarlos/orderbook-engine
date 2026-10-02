@@ -67,3 +67,19 @@ npm test -- core
   iteración ordenada ascendente y descendente).
 - Acoplar tipos a zod en lugar de derivar los tipos desde zod (se decidirá y fijará
   en este sprint para todo el proyecto).
+
+## 7. Enmiendas aprobadas (revisión arquitectónica post-entrega)
+
+Registradas por el arquitecto tras la entrega del sprint. Fuente de verdad para Sprint 01+.
+
+1. **`Order.sequence: bigint` (obligatorio)** — la prioridad Precio-Tiempo y el replay
+   determinista del WAL se basan en `sequence` monotónico, nunca en relojes.
+   `timestamp: number` se mantiene obligatorio pero como metadato logístico que
+   **no ordena la cola ni participa en la reconstrucción del estado**.
+2. **`OrderType` sin `CANCEL`** — la cancelación se modela como comando de ingress
+   (evento `order_cancelled` en Sprint 01), no como orden descansando en el libro.
+   Coherente con `docs/ARCHITECTURE.md §2`.
+3. **Deuda registrada para Sprint 01:** encapsular los enlaces mutables de
+   `OrderNode` (`prev`/`next`/`owner`), definir API atómica de fills parciales para
+   mantener `totalVolume` consistente, y migrar el runner de test del hook
+   experimental de `node:module` a `tsx`.
