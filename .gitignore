@@ -1,0 +1,32 @@
+# dependencies
+node_modules/
+
+# Next.js
+.next/
+out/
+
+# build
+dist/
+build/
+
+# misc
+.DS_Store
+*.log
+*.pem
+
+# env
+.env
+.env.local
+.env*.local
+
+# databases
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# benchmarks
+bench-results.json
+
+# typescript
+*.tsbuildinfo
