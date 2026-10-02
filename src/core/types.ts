@@ -44,6 +44,8 @@ export interface Order {
   /** Marca logística (ms epoch) provista por el caller. NO ordena la cola ni participa en la reconstrucción determinista del estado. */
   timestamp: number;
   timeInForce: TimeInForce;
+  /** Estado de vida de la orden. El caller crea con NEW; el engine actualiza PARTIALLY_FILLED / FILLED / CANCELLED. */
+  status: OrderStatus;
 }
 
 /**

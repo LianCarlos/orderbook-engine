@@ -24,6 +24,14 @@ export class LimitLevel {
     this.queue.remove(node);
   }
 
+  /**
+   * Aplica un fill parcial atómico sobre una orden del nivel. Delega en
+   * `queue.fill`. O(1).
+   */
+  fill(node: OrderNode, qty: bigint): void {
+    this.queue.fill(node, qty);
+  }
+
   /** True si el nivel no tiene órdenes. */
   isEmpty(): boolean {
     return this.queue.length === 0;

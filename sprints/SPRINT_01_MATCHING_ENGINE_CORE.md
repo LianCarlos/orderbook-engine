@@ -65,3 +65,23 @@ npm test -- engine
 - Orden de desempate Precio-Tiempo incorrecto en igualdad de precio (validar con
   tests explícitos de `sequence`).
 - Market orders que crucen niveles vacíos parcialmente (estado del libro inválido).
+
+## 7. Enmiendas aprobadas (revisión arquitectónica post-entrega)
+
+Registradas por el arquitecto tras la entrega del sprint. Fuente de verdad para Sprint 02+.
+
+1. **Alcance redefinido:** la entrega se concentró en `src/engine/matching.ts`
+   (clase `MatchingEngine`). Quedan diferidos a Sprint 02 (con el WAL): eventos de
+   dominio (`order_placed`, `order_matched`, `order_cancelled`), pipeline
+   `processor.ts`/`policies.ts` y **self-trade prevention** (misma `traderId` no
+   se cruza consigo misma).
+2. **Fuente única de verdad de volumen:** `DoublyLinkedList.fill(node, qty)` es la
+   API atómica para fills parciales (actualiza `filledQuantity` y `totalVolume`
+   juntos). El motor NO mantiene contador propio; `totalVolume` del motor agrega
+   los niveles. Nadie más puede mutar `filledQuantity` de una orden viva.
+3. **Niveles de precio:** el índice usa `Map` + array ordenado con búsqueda
+   binaria. Inserción/borrado de nivel es O(log L + L) por `splice` — deuda
+   documentada; re-evaluar skip list determinista en Sprint 05 (benchmarks).
+4. **`Order.status`** añadido al contrato (el motor actualiza
+   `PARTIALLY_FILLED` / `FILLED` / `CANCELLED`). `tsconfig.json`: `baseUrl`
+   eliminado por deprecación (TS 7.0); `paths` se resuelve relativo al tsconfig.

@@ -47,7 +47,8 @@ const { LimitLevel } = await import("../src/core/level.ts");
  * literales bigint y `filledQuantity: 0n`. `timestamp: 0` y
  * `sequence: BigInt(id)` deterministas (la secuencia monotónica sigue
  * el orden de inserción 1..N; nada de Date.now/Math.random en la
- * lógica del libro).
+ * lógica del libro). Incluye `status: "NEW"`: el tipo `Order` de
+ * `src/core/types.ts` (Sprint 01) lo exige como campo obligatorio.
  */
 function createOrder(id, price, quantity) {
   return {
@@ -61,6 +62,7 @@ function createOrder(id, price, quantity) {
     filledQuantity: 0n,
     timestamp: 0,
     timeInForce: "GTC",
+    status: "NEW",
   };
 }
 
@@ -262,6 +264,61 @@ function t4TimingGates() {
   return totalMs;
 }
 
+// ── T5 · Fill parcial atómico ────────────────────────────────────────
+
+function t5AtomicPartialFill() {
+  // Arrange — 3 órdenes de 10n c/u → totalVolume 30n
+  const list = new DoublyLinkedList();
+  const n1 = list.push(createOrder(1, 100, 10));
+  const n2 = list.push(createOrder(2, 100, 10));
+  const n3 = list.push(createOrder(3, 100, 10));
+  assert.equal(list.totalVolume, 30n);
+  assert.equal(list.length, 3);
+
+  // Act — fill parcial de 4n sobre el nodo central
+  list.fill(n2, 4n);
+
+  // Assert — atomicidad: totalVolume y filledQuantity cambian juntos
+  assert.equal(list.totalVolume, 26n, "totalVolume = 30n − 4n = 26n");
+  assert.equal(n2.order.filledQuantity, 4n, "filledQuantity = 4n");
+  assert.equal(n2.order.quantity, 10n, "quantity original intacta");
+  // los vecinos no se ven afectados
+  assert.equal(n1.order.filledQuantity, 0n);
+  assert.equal(n3.order.filledQuantity, 0n);
+
+  // Act — fill del remanente 6n → llena la orden exactamente
+  list.fill(n2, 6n);
+
+  // Assert
+  assert.equal(list.totalVolume, 20n, "totalVolume = 26n − 6n = 20n");
+  assert.equal(n2.order.filledQuantity, 10n, "orden llena: 4n + 6n = 10n");
+
+  // Act — remove de la orden llena: resta 0 al volumen
+  list.remove(n2);
+
+  // Assert
+  assert.equal(list.totalVolume, 20n, "remove de orden llena no altera totalVolume");
+  assert.equal(list.length, 2);
+
+  // Assert — rechazos (no mutan el libro)
+  // 1) fill sobre un nodo ya removido (owner = null)
+  assert.throws(() => list.fill(n2, 1n), Error);
+  // 2) fill sobre un nodo ajeno a la lista
+  const otherList = new DoublyLinkedList();
+  const foreignNode = otherList.push(createOrder(9, 100, 10));
+  assert.throws(() => list.fill(foreignNode, 1n), Error);
+  // 3) fill con qty <= 0n
+  assert.throws(() => list.fill(n1, 0n), Error);
+  // 4) fill que excede el remanente (10n disponible, pide 11n)
+  assert.throws(() => list.fill(n1, 11n), Error);
+
+  // Assert — el libro quedó intacto tras todos los rechazos
+  assert.equal(list.totalVolume, 20n);
+  assert.equal(list.length, 2);
+  assert.equal(n1.order.filledQuantity, 0n);
+  assert.equal(n3.order.filledQuantity, 0n);
+}
+
 // ── Ejecución ────────────────────────────────────────────────────────
 
 console.log("SPRINT 00 — Core Data Structures & Domain Types");
@@ -277,6 +334,10 @@ await runTest("T3 · LimitLevel add/remove/isEmpty/totalVolume", t3LimitLevel);
 await runTest(
   "T4 · Timing Gate A/B 100k push + 100k remove < 50 ms c/u",
   t4TimingGates,
+);
+await runTest(
+  "T5 · Fill parcial atómico (fill/validaciones/rechazos)",
+  t5AtomicPartialFill,
 );
 
 console.log("─".repeat(64));

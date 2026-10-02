@@ -80,6 +80,30 @@ export class DoublyLinkedList {
   }
 
   /**
+   * Aplica un fill parcial atómico: incrementa `filledQuantity` y
+   * decrementa `totalVolume` en la misma operación. Única vía legal
+   * para mutar `filledQuantity` de una orden viva. O(1).
+   */
+  fill(node: OrderNode, qty: bigint): void {
+    if (node.owner !== this) {
+      throw new Error(
+        "OrderNode does not belong to this list (already detached or from another list)",
+      );
+    }
+    const remaining = remainingVolume(node);
+    if (qty <= 0n) {
+      throw new Error(`fill quantity must be positive, got ${qty}`);
+    }
+    if (qty > remaining) {
+      throw new Error(
+        `fill quantity ${qty} exceeds remaining volume ${remaining}`,
+      );
+    }
+    node.order.filledQuantity += qty;
+    this._totalVolume -= qty;
+  }
+
+  /**
    * Desenlaza un nodo arbitrario sin recorrer la lista y actualiza el
    * volumen restante agregado. Lanza `Error` si el nodo no pertenece a
    * esta lista (ya desenlazado o de otra lista). O(1).
