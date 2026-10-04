@@ -47,7 +47,10 @@ CREATE TABLE IF NOT EXISTS events_log (
   created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000) -- ms epoch, lo pone SQLite (nunca el caller)
 );
 
--- Ledger de trades (doble entrada). Solo se crea; se usa en Sprint 03.
+-- Ledger de trades (doble entrada). Creada en Sprint 02; el
+-- SettlementLedger (Sprint 03) registra aquí los asientos de cada
+-- operación financiera dentro de la MISMA conexión/transacción SQLite
+-- que usa el WAL.
 CREATE TABLE IF NOT EXISTS trades_ledger (
   match_id       TEXT    PRIMARY KEY,  -- match-1, match-2, … (monotónico del motor)
   maker_order_id TEXT    NOT NULL,
@@ -56,6 +59,55 @@ CREATE TABLE IF NOT EXISTS trades_ledger (
   quantity       BIGINT  NOT NULL,     -- cantidad calzada (bigint del dominio)
   timestamp      INTEGER NOT NULL      -- marca logística provista por el caller (number)
 );
+
+-- Journal de asientos de doble entrada (Sprint 03). Append-only por
+-- operación; cada transacción (tx_id) balancea por asset: Σ débitos ==
+-- Σ créditos (regla inviolable verificada por SettlementLedger.audit).
+-- Red de seguridad SQLite: CHECKs de dominio, triggers que abortan
+-- UPDATE/DELETE, y settled_trades como registro único por liquidación.
+CREATE TABLE IF NOT EXISTS journal_entries (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  tx_id        TEXT    NOT NULL,
+  user_id      TEXT    NOT NULL,
+  account_type TEXT    NOT NULL CHECK (account_type IN ('AVAILABLE', 'LOCKED', 'FEE_VAULT')),
+  asset        TEXT    NOT NULL,
+  side         TEXT    NOT NULL CHECK (side IN ('DEBIT', 'CREDIT')),
+  amount       BIGINT  NOT NULL CHECK (amount > 0),
+  order_id     TEXT,              -- orden del dominio que originó el asiento
+  match_id     TEXT,              -- match del motor (solo asientos de liquidación)
+  created_at   INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
+);
+CREATE INDEX IF NOT EXISTS idx_journal_tx ON journal_entries(tx_id);
+
+-- Registro único de liquidaciones: la PK impide liquidar dos veces el
+-- mismo match a nivel de base de datos (falla toda la transacción).
+CREATE TABLE IF NOT EXISTS settled_trades (
+  match_id   TEXT    PRIMARY KEY,
+  created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
+);
+
+-- Append-only: ni el código ni un actor externo pueden alterar el
+-- journal o el registro de liquidaciones sin abortar.
+CREATE TRIGGER IF NOT EXISTS trg_journal_no_update
+BEFORE UPDATE ON journal_entries
+BEGIN
+  SELECT RAISE(ABORT, 'journal_entries is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_journal_no_delete
+BEFORE DELETE ON journal_entries
+BEGIN
+  SELECT RAISE(ABORT, 'journal_entries is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_settled_no_update
+BEFORE UPDATE ON settled_trades
+BEGIN
+  SELECT RAISE(ABORT, 'settled_trades is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_settled_no_delete
+BEFORE DELETE ON settled_trades
+BEGIN
+  SELECT RAISE(ABORT, 'settled_trades is append-only');
+END;
 
 -- Snapshots del estado del libro para fast recovery (Sprint 02.5).
 -- takeSnapshot congela órdenes vivas + matchCounter en state_data;
