@@ -12,6 +12,7 @@
  *   claves del dominio. `created_at` lo pone SQLite, nunca el caller:
  *   nada de relojes ni aleatoriedad dentro del payload.
  */
+import { createHash } from "node:crypto";
 import Database from "better-sqlite3";
 
 /** Tipos de evento persistidos en el WAL. */
@@ -36,6 +37,44 @@ export const BIGINT_KEYS = [
 ] as const;
 
 const BIGINT_KEY_SET: ReadonlySet<string> = new Set(BIGINT_KEYS);
+
+/** Hash génesis de la cadena: 64 ceros hex (WAL vacío). */
+export const GENESIS_HASH = "0".repeat(64);
+
+/**
+ * Preimagen canónica de un evento del WAL. Punto ÚNICO de verdad del
+ * formato compartido por `WalLogger` (append) y `replayState`
+ * (auditoría):
+ *
+ *   `${sequence}|${prevHash}|${eventType}|${payloadJson}`
+ *
+ * donde `payloadJson` es EXACTAMENTE el string persistido en la columna
+ * `payload` (serialización determinista de `serializePayload`).
+ */
+export function hashEventInput(
+  sequence: bigint,
+  prevHash: string,
+  eventType: string,
+  payloadJson: string,
+): string {
+  return sequence.toString() + "|" + prevHash + "|" + eventType + "|" + payloadJson;
+}
+
+/**
+ * Hash SHA-256 de un evento del WAL (camino de append). El replay usa
+ * `hashEventInput` con un hasher clonado para evitar el costo de
+ * construir un Hash nuevo por fila en el camino caliente.
+ */
+export function computeEventHash(
+  sequence: bigint,
+  prevHash: string,
+  eventType: string,
+  payloadJson: string,
+): string {
+  return createHash("sha256")
+    .update(hashEventInput(sequence, prevHash, eventType, payloadJson))
+    .digest("hex");
+}
 
 /**
  * Replacer de `JSON.stringify` para payloads del WAL.
@@ -181,34 +220,47 @@ export function parseOrderPayload(json: string): Record<string, unknown> {
 }
 
 /**
- * Logger append-only del WAL.
+ * Logger append-only del WAL con hash chain SHA-256 (Sprint 02.5).
  *
  * Invariantes:
  * - Una única instancia por conexión/DB por proceso (si se crean dos,
- *   la segunda re-lee `MAX(sequence)` de la DB y continúa; si ambas
- *   coexisten antes de escribir, la monotonicidad deja de estar
- *   garantizada).
+ *   la segunda re-lee `MAX(sequence)` y el último `hash` de la DB y
+ *   continúa; si ambas coexisten antes de escribir, la monotonicidad
+ *   y la cadena dejan de estar garantizadas).
  * - Secuencias estrictamente crecientes en proceso: nunca se reutiliza
  *   ni se asigna dos veces.
+ * - Cada fila enlaza `prev_hash` = hash de la fila anterior y publica
+ *   `hash = SHA256(sequence|prev_hash|event_type|payload)`; la cadena
+ *   es auditable en caliente por el replay.
  * - `appendBatch` es atómico: o persisten todos los eventos del lote o
  *   ninguno (rollback automático de la transacción).
  */
 export class WalLogger {
   private readonly _db: Database.Database;
-  private readonly _insertStmt: Database.Statement<[number, string, string]>;
+  private readonly _insertStmt: Database.Statement<[number, string, string, string, string]>;
   /** Próxima secuencia a asignar (se inicializa desde la DB). */
   private _nextSequence: bigint;
+  /** Último hash enlazado (GENESIS_HASH si el WAL está vacío). */
+  private _lastHash: string;
 
   constructor(db: Database.Database) {
     this._db = db;
-    this._insertStmt = db.prepare<[number, string, string]>(
-      "INSERT INTO events_log (sequence, event_type, payload) VALUES (?, ?, ?)",
+    this._insertStmt = db.prepare<[number, string, string, string, string]>(
+      `INSERT INTO events_log (sequence, event_type, payload, prev_hash, hash)
+       VALUES (?, ?, ?, ?, ?)`,
     );
     const row = db
-      .prepare("SELECT COALESCE(MAX(sequence), 0) AS max_sequence FROM events_log")
-      .get() as { max_sequence: number };
-    // Reinicios reales: el contador continúa desde el último evento persistido.
+      .prepare(
+        `SELECT COALESCE(MAX(sequence), 0) AS max_sequence, hash AS last_hash
+         FROM events_log
+         ORDER BY sequence DESC
+         LIMIT 1`,
+      )
+      .get() as { max_sequence: number; last_hash: string | null };
+    // Reinicios reales: el contador continúa desde el último evento
+    // persistido y la hash chain enlaza con el hash de esa última fila.
     this._nextSequence = BigInt(row.max_sequence) + 1n;
+    this._lastHash = row.last_hash ?? GENESIS_HASH;
   }
 
   /** Última secuencia persistida (0n si el WAL está vacío). */
@@ -217,33 +269,33 @@ export class WalLogger {
   }
 
   /**
-   * Persiste un evento con la siguiente secuencia monotónica.
-   * Devuelve la secuencia asignada.
+   * Persiste un evento con la siguiente secuencia monotónica, enlazado
+   * a la hash chain (prev_hash = hash anterior, hash = SHA-256 de la
+   * fila). Devuelve la secuencia asignada.
    */
   appendEvent(type: EventType, payload: object): bigint {
     const sequence = this._nextSequence++;
-    this._insertStmt.run(Number(sequence), type, serializePayload(payload));
+    const payloadJson = serializePayload(payload);
+    const hash = computeEventHash(sequence, this._lastHash, type, payloadJson);
+    this._insertStmt.run(Number(sequence), type, payloadJson, this._lastHash, hash);
+    this._lastHash = hash;
     return sequence;
   }
 
   /**
-   * Persiste un lote de eventos de forma ATÓMICA (transacción SQLite).
-   * Las secuencias se asignan contiguas y en el orden del array.
-   * Devuelve la última secuencia asignada; con lote vacío devuelve
-   * `lastSequence` (no-op, sin transacción).
+   * Persiste un lote de eventos de forma ATÓMICA (transacción SQLite)
+   * manteniendo la hash chain fila a fila. Las secuencias se asignan
+   * contiguas y en el orden del array. Devuelve la última secuencia
+   * asignada; con lote vacío devuelve `lastSequence` (no-op).
    */
   appendBatch(events: WalEventInput[]): bigint {
     if (events.length === 0) {
       return this.lastSequence;
     }
-    const insert = this._insertStmt;
-    const db = this._db;
     let last = 0n;
-    db.transaction((batch: WalEventInput[]) => {
+    this._db.transaction((batch: WalEventInput[]) => {
       for (const event of batch) {
-        const sequence = this._nextSequence++;
-        insert.run(Number(sequence), event.type, serializePayload(event.payload));
-        last = sequence;
+        last = this.appendEvent(event.type, event.payload);
       }
     })(events);
     return last;

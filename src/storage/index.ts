@@ -9,3 +9,4 @@
 export * from "./db";
 export * from "./wal";
 export * from "./replay";
+export * from "./snapshot";
