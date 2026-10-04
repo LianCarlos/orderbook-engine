@@ -88,12 +88,28 @@ export interface LedgerAuditResult {
 type Side = "BUY" | "SELL";
 type BalancesByType = Map<AccountType, bigint>;
 
-interface OrderRegistration {
+/** Registro del hold de una orden. */
+export interface OrderRegistration {
   userId: string;
   asset: string;
   side: Side;
   /** Retención aún no consumida (base o quote según el lado). */
   remaining: bigint;
+}
+
+/** Snapshot capturable del estado en memoria del ledger (pipeline). */
+export interface LedgerStateCapture {
+  balances: Array<[userId: string, assets: Array<[asset: string, types: Array<[type: AccountType, amount: bigint]>]>]>;
+  orders: Array<[orderId: string, registration: OrderRegistration]>;
+  txCounter: number;
+}
+
+/** Operación planificada: asientos validados + mutación de memoria diferida. */
+interface PlannedOp {
+  entries: LedgerEntry[];
+  orderId: string | null;
+  matchId: string | null;
+  after: () => void;
 }
 
 /**
@@ -151,6 +167,21 @@ export class SettlementLedger {
     this._takerFeeBps = options.takerFeeBps ?? 0;
   }
 
+  /** Comisión maker en puntos básicos (config del mercado). */
+  get makerFeeBps(): number {
+    return this._makerFeeBps;
+  }
+
+  /** Comisión taker en puntos básicos (config del mercado). */
+  get takerFeeBps(): number {
+    return this._takerFeeBps;
+  }
+
+  /** Quote total que debe retener un comprador para un principal dado (incluye taker fee). */
+  quoteRequired(principal: bigint): bigint {
+    return principal + (principal * BigInt(this._takerFeeBps)) / 10_000n;
+  }
+
   // ── Consultas ──────────────────────────────────────────────────────
 
   /** Saldo de una subcuenta. O(1). */
@@ -180,14 +211,15 @@ export class SettlementLedger {
         `deposit inválido para ${userId} en ${asset}: ${amount.toString()}`,
       );
     }
-    this._commit(
-      [
+    this._commitPlanned({
+      entries: [
         { accountId: userId, accountType: "AVAILABLE", asset, side: "DEBIT", amount },
         { accountId: EXTERNAL_ACCOUNT_ID, accountType: "AVAILABLE", asset, side: "CREDIT", amount },
       ],
-      null,
-      null,
-    );
+      orderId: null,
+      matchId: null,
+      after: () => {},
+    });
   }
 
   /**
@@ -196,7 +228,27 @@ export class SettlementLedger {
    * Falla con {@link BalanceOverflowError} ANTES de tocar nada si no
    * hay fondos libres suficientes (la orden jamás llega al libro).
    */
+  /** Retiene fondos de una orden: AVAILABLE → LOCKED (transaccional). */
   holdFunds(userId: string, asset: string, amount: bigint, orderId: string): void {
+    this._commitPlanned(this._planHold(userId, asset, amount, orderId));
+  }
+
+  /**
+   * Variante cruda para el `ExecutionPipeline`: escribe el SQL dentro
+   * de la transacción abierta del caller y muta la memoria de
+   * inmediato (el pipeline restaura desde captura si su transacción
+   * revierte).
+   */
+  holdFundsRaw(userId: string, asset: string, amount: bigint, orderId: string): void {
+    this._commitPlannedRaw(this._planHold(userId, asset, amount, orderId));
+  }
+
+  private _planHold(
+    userId: string,
+    asset: string,
+    amount: bigint,
+    orderId: string,
+  ): PlannedOp {
     const side = this._sideOf(asset);
     if (amount <= 0n) {
       throw new BalanceOverflowError(
@@ -213,27 +265,47 @@ export class SettlementLedger {
     if (this._orders.has(orderId)) {
       throw new LedgerError(`orderId ya registrado en el ledger: ${orderId}`);
     }
-    this._commit(
-      [
+    return {
+      entries: [
         { accountId: userId, accountType: "LOCKED", asset, side: "DEBIT", amount },
         { accountId: userId, accountType: "AVAILABLE", asset, side: "CREDIT", amount },
       ],
       orderId,
-      null,
-    );
-    this._orders.set(orderId, { userId, asset, side, remaining: amount });
+      matchId: null,
+      after: () => {
+        this._orders.set(orderId, { userId, asset, side, remaining: amount });
+      },
+    };
   }
 
   /**
    * Libera retenciones al cancelar/expirar una orden: LOCKED → AVAILABLE.
    * `amount === 0n` es un no-op válido. Falla si LOCKED < amount.
    */
+  /** Libera retenciones al cancelar/expirar una orden (transaccional). */
   releaseFunds(userId: string, asset: string, amount: bigint, orderId: string): void {
-    if (amount < 0n) {
-      throw new BalanceOverflowError(`release negativo para ${orderId}`);
-    }
     if (amount === 0n) {
       return;
+    }
+    this._commitPlanned(this._planRelease(userId, asset, amount, orderId));
+  }
+
+  /** Variante cruda para el `ExecutionPipeline` (ver holdFundsRaw). */
+  releaseFundsRaw(userId: string, asset: string, amount: bigint, orderId: string): void {
+    if (amount === 0n) {
+      return;
+    }
+    this._commitPlannedRaw(this._planRelease(userId, asset, amount, orderId));
+  }
+
+  private _planRelease(
+    userId: string,
+    asset: string,
+    amount: bigint,
+    orderId: string,
+  ): PlannedOp {
+    if (amount < 0n) {
+      throw new BalanceOverflowError(`release negativo para ${orderId}`);
     }
     const registration = this._orders.get(orderId);
     if (registration !== undefined) {
@@ -251,20 +323,22 @@ export class SettlementLedger {
           `retenidos ${locked.toString()}`,
       );
     }
-    this._commit(
-      [
+    return {
+      entries: [
         { accountId: userId, accountType: "AVAILABLE", asset, side: "DEBIT", amount },
         { accountId: userId, accountType: "LOCKED", asset, side: "CREDIT", amount },
       ],
       orderId,
-      null,
-    );
-    if (registration !== undefined) {
-      registration.remaining -= amount;
-      if (registration.remaining <= 0n) {
-        this._orders.delete(orderId);
-      }
-    }
+      matchId: null,
+      after: () => {
+        if (registration !== undefined) {
+          registration.remaining -= amount;
+          if (registration.remaining <= 0n) {
+            this._orders.delete(orderId);
+          }
+        }
+      },
+    };
   }
 
   /**
@@ -278,7 +352,17 @@ export class SettlementLedger {
    * cualquier desviación de saldo lanza {@link BalanceOverflowError} o
    * {@link UnbalancedTransactionError} sin persistir nada.
    */
+  /** Liquida atómicamente un `Trade` entre Maker y Taker (transaccional). */
   settleTrade(trade: Trade): void {
+    this._commitPlanned(this._planSettle(trade));
+  }
+
+  /** Variante cruda para el `ExecutionPipeline` (ver holdFundsRaw). */
+  settleTradeRaw(trade: Trade): void {
+    this._commitPlannedRaw(this._planSettle(trade));
+  }
+
+  private _planSettle(trade: Trade): PlannedOp {
     if (trade.quantity <= 0n || trade.price <= 0n) {
       throw new LedgerError(
         `settleTrade ${trade.matchId}: quantity/price deben ser positivos`,
@@ -342,18 +426,23 @@ export class SettlementLedger {
         amount: feeTotal,
       });
     }
-    this._commit(entries, trade.takerOrderId, trade.matchId);
-
-    // Limpieza del registro de holds (anti-fuga): la retención se
-    // consume en su propia unidad y el registro muere al agotarse.
-    seller.remaining -= trade.quantity;
-    if (seller.remaining <= 0n) {
-      this._orders.delete(sellerOrderId);
-    }
-    buyer.remaining -= buyerDebit;
-    if (buyer.remaining <= 0n) {
-      this._orders.delete(buyerOrderId);
-    }
+    return {
+      entries,
+      orderId: trade.takerOrderId,
+      matchId: trade.matchId,
+      // Limpieza del registro de holds (anti-fuga): la retención se
+      // consume en su propia unidad y el registro muere al agotarse.
+      after: () => {
+        seller.remaining -= trade.quantity;
+        if (seller.remaining <= 0n) {
+          this._orders.delete(sellerOrderId);
+        }
+        buyer.remaining -= buyerDebit;
+        if (buyer.remaining <= 0n) {
+          this._orders.delete(buyerOrderId);
+        }
+      },
+    };
   }
 
   /**
@@ -459,6 +548,40 @@ export class SettlementLedger {
     return { unbalancedTransactions, memoryMismatches, mismatchDetails, byAsset };
   }
 
+  /** Snapshot profundo del estado en memoria (para reversión del pipeline). */
+  captureState(): LedgerStateCapture {
+    const balances: LedgerStateCapture["balances"] = [];
+    for (const [userId, assets] of this._balances) {
+      const assetList: Array<[string, Array<[AccountType, bigint]>]> = [];
+      for (const [asset, types] of assets) {
+        assetList.push([asset, [...types]]);
+      }
+      balances.push([userId, assetList]);
+    }
+    const orders: Array<[string, OrderRegistration]> = [];
+    for (const [orderId, registration] of this._orders) {
+      orders.push([orderId, { ...registration }]);
+    }
+    return { balances, orders, txCounter: this._txCounter };
+  }
+
+  /** Restaura el estado en memoria desde una captura previa. */
+  restoreState(capture: LedgerStateCapture): void {
+    this._balances.clear();
+    for (const [userId, assets] of capture.balances) {
+      const assetMap = new Map<string, BalancesByType>();
+      for (const [asset, types] of assets) {
+        assetMap.set(asset, new Map(types));
+      }
+      this._balances.set(userId, assetMap);
+    }
+    this._orders.clear();
+    for (const [orderId, registration] of capture.orders) {
+      this._orders.set(orderId, { ...registration });
+    }
+    this._txCounter = capture.txCounter;
+  }
+
   // ── Internos ───────────────────────────────────────────────────────
 
   /** Deriva el lado de la orden a partir del activo bloqueado. */
@@ -474,47 +597,68 @@ export class SettlementLedger {
     );
   }
 
+  /** Siguiente id de transacción contable (monotónico en proceso). */
+  private _nextTxId(): string {
+    return `tx-${String(++this._txCounter).padStart(6, "0")}`;
+  }
+
   /**
-   * Núcleo transaccional: valida el balance de asientos y la precisión
-   * de los montos, registra la liquidación (si aplica) y persiste en
-   * `journal_entries` dentro de UNA transacción SQLite. La mutación de
-   * memoria ocurre solo tras el commit (si el SQL falla, la memoria
-   * queda intacta).
+   * Núcleo transaccional standalone: valida y persiste los asientos en
+   * UNA transacción SQLite; la memoria se muta solo tras el commit (si
+   * el SQL falla, la memoria queda intacta).
    */
-  private _commit(
-    entries: LedgerEntry[],
-    orderId: string | null,
-    matchId: string | null,
-  ): void {
-    assertBalanced(entries);
-    for (const entry of entries) {
+  private _commitPlanned(plan: PlannedOp): void {
+    const txId = this._nextTxId();
+    this._db.transaction(() => {
+      this._writePlanned(txId, plan);
+    })();
+    this._applyEntries(plan.entries);
+    plan.after();
+  }
+
+  /**
+   * Núcleo crudo para el `ExecutionPipeline`: asume que el caller tiene
+   * UNA transacción SQLite abierta (no abre otra) y muta la memoria de
+   * inmediato. Si la transacción externa revierte, el pipeline debe
+   * restaurar el estado en RAM desde `captureState()`.
+   */
+  private _commitPlannedRaw(plan: PlannedOp): void {
+    const txId = this._nextTxId();
+    this._writePlanned(txId, plan);
+    this._applyEntries(plan.entries);
+    plan.after();
+  }
+
+  /** Escritura SQL de un plan validado (sin transacción propia). */
+  private _writePlanned(txId: string, plan: PlannedOp): void {
+    assertBalanced(plan.entries);
+    for (const entry of plan.entries) {
       if (entry.amount > BigInt(Number.MAX_SAFE_INTEGER)) {
         throw new BalanceOverflowError(
           `monto fuera del rango seguro de precisión: ${entry.amount.toString()} ${entry.asset}`,
         );
       }
     }
-    const txId = `tx-${String(++this._txCounter).padStart(6, "0")}`;
-    const insert = this._insertStmt;
-    const settleStmt = this._settleStmt;
-    this._db.transaction(() => {
-      if (matchId !== null) {
-        // PK única: una liquidación duplicada aborta toda la transacción.
-        settleStmt.run(matchId);
-      }
-      for (const entry of entries) {
-        insert.run(
-          txId,
-          entry.accountId,
-          entry.accountType,
-          entry.asset,
-          entry.side,
-          Number(entry.amount),
-          orderId,
-          matchId,
-        );
-      }
-    })();
+    if (plan.matchId !== null) {
+      // PK única: una liquidación duplicada aborta toda la transacción.
+      this._settleStmt.run(plan.matchId);
+    }
+    for (const entry of plan.entries) {
+      this._insertStmt.run(
+        txId,
+        entry.accountId,
+        entry.accountType,
+        entry.asset,
+        entry.side,
+        Number(entry.amount),
+        plan.orderId,
+        plan.matchId,
+      );
+    }
+  }
+
+  /** Aplica los asientos ya persistidos a la memoria. */
+  private _applyEntries(entries: LedgerEntry[]): void {
     for (const entry of entries) {
       this._applyEntry(entry);
     }

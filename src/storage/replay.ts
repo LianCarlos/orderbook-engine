@@ -17,8 +17,13 @@ import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { MatchingEngine } from "../engine/matching";
 import type { Order } from "../core/types";
-import { GENESIS_HASH, hashEventInput, parseOrderPayload } from "./wal";
-import { getLatestSnapshot, restoreEngineState } from "./snapshot";
+import { GENESIS_HASH, parseOrderPayload, writeEventHashInput } from "./wal";
+import {
+  computeSnapshotStateHash,
+  getLatestSnapshot,
+  resetEngineState,
+  restoreEngineState,
+} from "./snapshot";
 
 /**
  * Fila física de `events_log` (raw mode: array de columnas, sin
@@ -38,6 +43,10 @@ export interface ReplayResult {
   replayedEvents: number;
   /** Duración real de la aplicación en ms (performance.now). */
   durationMs: number;
+  /** Vía de recuperación: snapshot + delta, o replay limpio desde 0. */
+  recovery: "snapshot" | "clean";
+  /** Motivo del fallback a replay limpio (null si no hubo fallback). */
+  fallbackReason: string | null;
 }
 
 /** Error base del replay: fallo explícito y tipado, nunca silencioso. */
@@ -75,6 +84,32 @@ export class SnapshotCorruptionError extends ReplayError {
     super(message);
     this.name = "SnapshotCorruptionError";
     this.snapshotId = snapshotId;
+  }
+}
+
+/**
+ * Desacoplamiento entre snapshot y WAL (Sprint 03.5): el hash de la
+ * fila `lastSequence` de events_log no coincide con `wal_anchor_hash`.
+ * El replay descarta el snapshot y fuerza un replay limpio desde 0.
+ */
+export class SnapshotAnchorMismatchError extends ReplayError {
+  readonly snapshotId: string;
+  readonly lastSequence: bigint;
+
+  constructor(
+    snapshotId: string,
+    lastSequence: bigint,
+    storedAnchor: string,
+    actualAnchor: string | null,
+  ) {
+    super(
+      `snapshots: ancla desacoplada en ${snapshotId} para sequence ${lastSequence}: ` +
+        `ancla del snapshot ${storedAnchor.slice(0, 16)}…, ` +
+        `hash real del WAL ${actualAnchor === null ? "∅ (fila ausente)" : actualAnchor.slice(0, 16) + "…"}`,
+    );
+    this.name = "SnapshotAnchorMismatchError";
+    this.snapshotId = snapshotId;
+    this.lastSequence = lastSequence;
   }
 }
 
@@ -118,43 +153,64 @@ export function replayState(db: Database.Database, engine: MatchingEngine): Repl
   const started = performance.now();
 
   // 1. Fast recovery: el snapshot más reciente es el punto de partida.
+  // Si el ancla criptográfica se desacopla del WAL, se descarta el
+  // snapshot y se fuerza replay limpio desde el evento 0.
   const snapshot = getLatestSnapshot(db);
-  let startSequence: bigint;
+  let recovery: "snapshot" | "clean" = "clean";
+  let fallbackReason: string | null = null;
+  let startSequence = 1n;
   let expectedPrevHash = GENESIS_HASH;
 
   if (snapshot !== null) {
-    // H1: integridad del snapshot — SHA-256 de state_data verificado
-    // ANTES de restaurar (un snapshot alterado con JSON válido nunca
-    // envenena el libro en silencio).
-    const computedStateHash = createHash("sha256")
-      .update(snapshot.stateData)
-      .digest("hex");
-    if (computedStateHash !== snapshot.stateHash) {
-      throw new SnapshotCorruptionError(
-        snapshot.snapshotId,
-        `snapshots: state_data alterado en ${snapshot.snapshotId}: ` +
-          `hash almacenado ${snapshot.stateHash.slice(0, 16)}…, ` +
-          `calculado ${computedStateHash.slice(0, 16)}…`,
-      );
-    }
     try {
-      restoreEngineState(engine, snapshot.stateData);
-    } catch (cause) {
-      throw new ReplayError(
-        `snapshots: state_data corrupto en ${snapshot.snapshotId}: ${(cause as Error).message}`,
-        { cause },
+      // H1: integridad del snapshot — SHA-256(wal_anchor_hash +
+      // last_sequence + state_data) verificado ANTES de restaurar.
+      const computedStateHash = computeSnapshotStateHash(
+        snapshot.walAnchorHash,
+        snapshot.lastSequence,
+        snapshot.stateData,
       );
+      if (computedStateHash !== snapshot.stateHash) {
+        throw new SnapshotCorruptionError(
+          snapshot.snapshotId,
+          `snapshots: state_data alterado en ${snapshot.snapshotId}: ` +
+            `hash almacenado ${snapshot.stateHash.slice(0, 16)}…, ` +
+            `calculado ${computedStateHash.slice(0, 16)}…`,
+        );
+      }
+      // Anclaje cruzado snapshot↔WAL: el ancla debe coincidir EXACTA
+      // con el hash de la fila last_sequence de events_log.
+      const anchorRow = db
+        .prepare("SELECT hash FROM events_log WHERE sequence = ?")
+        .get(Number(snapshot.lastSequence)) as { hash: string } | undefined;
+      const actualAnchor = anchorRow === undefined ? null : anchorRow.hash;
+      if (actualAnchor === null || actualAnchor === "" || actualAnchor !== snapshot.walAnchorHash) {
+        throw new SnapshotAnchorMismatchError(
+          snapshot.snapshotId,
+          snapshot.lastSequence,
+          snapshot.walAnchorHash,
+          actualAnchor,
+        );
+      }
+
+      restoreEngineState(engine, snapshot.stateData);
+      recovery = "snapshot";
+      startSequence = snapshot.lastSequence + 1n;
+      expectedPrevHash = actualAnchor;
+    } catch (err) {
+      if (err instanceof SnapshotAnchorMismatchError) {
+        // Snapshot válido pero desalineado con el WAL: descartarlo y
+        // reconstruir desde el evento 0 (motor a estado virgen).
+        fallbackReason = `anchor_mismatch (${err.message})`;
+        resetEngineState(engine);
+        recovery = "clean";
+        startSequence = 1n;
+        expectedPrevHash = GENESIS_HASH;
+      } else {
+        // Corrupción real del snapshot: abortar con error tipado.
+        throw err;
+      }
     }
-    startSequence = snapshot.lastSequence + 1n;
-    // Ancla de la cadena: hash del último evento cubierto por el snapshot.
-    const anchor = db
-      .prepare("SELECT hash FROM events_log WHERE sequence = ?")
-      .get(Number(snapshot.lastSequence)) as { hash: string } | undefined;
-    if (anchor !== undefined && anchor.hash !== "") {
-      expectedPrevHash = anchor.hash;
-    }
-  } else {
-    startSequence = 1n;
   }
 
   // 2. Delta de eventos con auditoría incondicional de la hash chain.
@@ -176,7 +232,11 @@ export function replayState(db: Database.Database, engine: MatchingEngine): Repl
     // event_type desconocido: corrupción de esquema/versión. Se evalúa
     // antes que la cadena para conservar UnknownEventTypeError ante
     // filas legacy sin hash.
-    if (eventType !== "ORDER_NEW" && eventType !== "ORDER_CANCEL") {
+    if (
+      eventType !== "ORDER_NEW" &&
+      eventType !== "ORDER_CANCEL" &&
+      eventType !== "TRADE_MATCH"
+    ) {
       throw new UnknownEventTypeError(sequence, eventType);
     }
 
@@ -189,9 +249,9 @@ export function replayState(db: Database.Database, engine: MatchingEngine): Repl
           `esperado ${expectedPrevHash.slice(0, 16)}…, almacenado ${storedPrevHash.slice(0, 16)}…`,
       );
     }
-    const computedHash = createHash("sha256")
-      .update(hashEventInput(sequence, expectedPrevHash, eventType, payloadJson))
-      .digest("hex");
+    const hash = createHash("sha256");
+    writeEventHashInput(hash, sequence, expectedPrevHash, eventType, payloadJson);
+    const computedHash = hash.digest("hex");
     if (computedHash !== storedHash) {
       throw new WalCorruptionError(
         sequence,
@@ -216,7 +276,7 @@ export function replayState(db: Database.Database, engine: MatchingEngine): Repl
       // serializó antes de que el logger asignara la secuencia).
       order.sequence = sequence;
       engine.processOrder(order as unknown as Order);
-    } else {
+    } else if (eventType === "ORDER_CANCEL") {
       let cancel: { orderId: string };
       try {
         // Payload mínimo sin bigints: JSON.parse plano.
@@ -228,11 +288,20 @@ export function replayState(db: Database.Database, engine: MatchingEngine): Repl
         );
       }
       engine.cancelOrder(cancel.orderId);
+    } else {
+      // TRADE_MATCH: verificado por la hash chain pero NO re-aplicado —
+      // los trades se regeneran determinísticamente al re-ejecutar los
+      // ORDER_NEW (el motor es una proyección del flujo de órdenes).
     }
     replayedEvents += 1;
   }
 
-  return { replayedEvents, durationMs: performance.now() - started };
+  return {
+    replayedEvents,
+    durationMs: performance.now() - started,
+    recovery,
+    fallbackReason,
+  };
 }
 
 export default replayState;

@@ -12,11 +12,11 @@
  *   claves del dominio. `created_at` lo pone SQLite, nunca el caller:
  *   nada de relojes ni aleatoriedad dentro del payload.
  */
-import { createHash } from "node:crypto";
+import { createHash, type Hash } from "node:crypto";
 import Database from "better-sqlite3";
 
 /** Tipos de evento persistidos en el WAL. */
-export type EventType = "ORDER_NEW" | "ORDER_CANCEL";
+export type EventType = "ORDER_NEW" | "ORDER_CANCEL" | "TRADE_MATCH";
 
 /** Evento pendiente de append (payload crudo, sin serializar). */
 export interface WalEventInput {
@@ -41,39 +41,50 @@ const BIGINT_KEY_SET: ReadonlySet<string> = new Set(BIGINT_KEYS);
 /** Hash génesis de la cadena: 64 ceros hex (WAL vacío). */
 export const GENESIS_HASH = "0".repeat(64);
 
+/** Separador del formato canónico de preimagen (constante compartida). */
+const PREIMAGE_SEP = "|";
+
 /**
- * Preimagen canónica de un evento del WAL. Punto ÚNICO de verdad del
- * formato compartido por `WalLogger` (append) y `replayState`
+ * Formato canónico de preimagen de un evento del WAL. Punto ÚNICO de
+ * verdad compartido por `WalLogger` (append) y `replayState`
  * (auditoría):
  *
  *   `${sequence}|${prevHash}|${eventType}|${payloadJson}`
  *
  * donde `payloadJson` es EXACTAMENTE el string persistido en la columna
  * `payload` (serialización determinista de `serializePayload`).
+ *
+ * Optimización de GC (Sprint 03.5): escribe directamente sobre el
+ * `Hash` reutilizado por el caller, SIN materializar la concatenación
+ * masiva de strings (antes se creaba un string de ~700 B por evento).
  */
-export function hashEventInput(
+export function writeEventHashInput(
+  hash: Hash,
   sequence: bigint,
   prevHash: string,
   eventType: string,
   payloadJson: string,
-): string {
-  return sequence.toString() + "|" + prevHash + "|" + eventType + "|" + payloadJson;
+): void {
+  hash
+    .update(sequence.toString())
+    .update(PREIMAGE_SEP)
+    .update(prevHash)
+    .update(PREIMAGE_SEP)
+    .update(eventType)
+    .update(PREIMAGE_SEP)
+    .update(payloadJson);
 }
 
-/**
- * Hash SHA-256 de un evento del WAL (camino de append). El replay usa
- * `hashEventInput` con un hasher clonado para evitar el costo de
- * construir un Hash nuevo por fila en el camino caliente.
- */
+/** Hash SHA-256 de un evento del WAL (camino de append). */
 export function computeEventHash(
   sequence: bigint,
   prevHash: string,
   eventType: string,
   payloadJson: string,
 ): string {
-  return createHash("sha256")
-    .update(hashEventInput(sequence, prevHash, eventType, payloadJson))
-    .digest("hex");
+  const hash = createHash("sha256");
+  writeEventHashInput(hash, sequence, prevHash, eventType, payloadJson);
+  return hash.digest("hex");
 }
 
 /**
@@ -266,6 +277,22 @@ export class WalLogger {
   /** Última secuencia persistida (0n si el WAL está vacío). */
   get lastSequence(): bigint {
     return this._nextSequence - 1n;
+  }
+
+  /** Captura del estado en RAM del logger (reversión del pipeline). */
+  captureState(): { nextSequence: bigint; lastHash: string } {
+    return { nextSequence: this._nextSequence, lastHash: this._lastHash };
+  }
+
+  /**
+   * Restaura el estado en RAM desde una captura previa. Crítico para la
+   * atomicidad del `ExecutionPipeline`: si la transacción SQL revierte,
+   * las secuencias y el último hash vuelven exactamente al punto previo
+   * (sin huecos ni eslabones fantasma en la hash chain).
+   */
+  restoreState(state: { nextSequence: bigint; lastHash: string }): void {
+    this._nextSequence = state.nextSequence;
+    this._lastHash = state.lastHash;
   }
 
   /**

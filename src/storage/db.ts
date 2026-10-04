@@ -109,17 +109,19 @@ BEGIN
   SELECT RAISE(ABORT, 'settled_trades is append-only');
 END;
 
--- Snapshots del estado del libro para fast recovery (Sprint 02.5).
--- takeSnapshot congela órdenes vivas + matchCounter en state_data;
--- el replay parte del más reciente y aplica solo el delta.
--- state_hash = SHA-256(state_data): integridad verificada antes de
--- restaurar (fail-closed si el snapshot fue alterado).
+-- Snapshots del estado del libro para fast recovery (Sprint 02.5,
+-- anclaje criptográfico cruzado con el WAL en Sprint 03.5):
+-- state_hash = SHA256(wal_anchor_hash + last_sequence + state_data).
+-- El replay verifica que wal_anchor_hash coincida con el hash real de
+-- la fila last_sequence de events_log; un desacoplamiento descarta el
+-- snapshot y fuerza replay limpio desde el evento 0.
 CREATE TABLE IF NOT EXISTS snapshots (
-  snapshot_id   TEXT    PRIMARY KEY,  -- uuid generado al tomar el snapshot
-  last_sequence BIGINT  NOT NULL,     -- última secuencia del WAL cubierta por el snapshot
-  state_data    TEXT    NOT NULL,     -- estado serializado (bigints como string)
-  state_hash    TEXT    NOT NULL DEFAULT '', -- SHA-256 de state_data
-  created_at    INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
+  snapshot_id     TEXT    PRIMARY KEY,  -- uuid generado al tomar el snapshot
+  last_sequence   BIGINT  NOT NULL,     -- última secuencia del WAL cubierta por el snapshot
+  state_data      TEXT    NOT NULL,     -- estado serializado (bigints como string)
+  state_hash      TEXT    NOT NULL DEFAULT '', -- SHA-256(wal_anchor_hash + last_sequence + state_data)
+  wal_anchor_hash TEXT    NOT NULL DEFAULT '', -- hash SHA-256 del evento last_sequence en events_log
+  created_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
 );
 
 -- === ÍNDICES ===
@@ -155,6 +157,11 @@ function ensureHardeningColumns(db: Database.Database): void {
   if (!snapshotNames.has("state_hash")) {
     db.exec(
       "ALTER TABLE snapshots ADD COLUMN state_hash TEXT NOT NULL DEFAULT ''",
+    );
+  }
+  if (!snapshotNames.has("wal_anchor_hash")) {
+    db.exec(
+      "ALTER TABLE snapshots ADD COLUMN wal_anchor_hash TEXT NOT NULL DEFAULT ''",
     );
   }
 }

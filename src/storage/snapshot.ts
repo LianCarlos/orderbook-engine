@@ -51,13 +51,38 @@ function internalsOf(engine: MatchingEngine): EngineInternals {
   return engine as unknown as EngineInternals;
 }
 
-/** Snapshot persistido (metadatos + estado serializado + hash). */
+/** Error base del módulo de snapshots. */
+export class SnapshotError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SnapshotError";
+  }
+}
+
+/** Snapshot persistido (metadatos + estado serializado + hashes). */
 export interface StoredSnapshot {
   snapshotId: string;
   lastSequence: bigint;
   stateData: string;
-  /** SHA-256 de `stateData`; verificado antes de restaurar. */
+  /** SHA-256(walAnchorHash + lastSequence + stateData); verificado antes de restaurar. */
   stateHash: string;
+  /** Hash SHA-256 del evento `lastSequence` en events_log (ancla cruzada). */
+  walAnchorHash: string;
+}
+
+/**
+ * Hash de integridad del snapshot (Sprint 03.5): ancla criptográficamente
+ * el estado al WAL.
+ *   state_hash = SHA256(wal_anchor_hash + last_sequence + state_data)
+ */
+export function computeSnapshotStateHash(
+  walAnchorHash: string,
+  lastSequence: bigint,
+  stateData: string,
+): string {
+  return createHash("sha256")
+    .update(walAnchorHash + lastSequence.toString() + stateData)
+    .digest("hex");
 }
 
 /**
@@ -71,6 +96,12 @@ export interface StoredSnapshot {
  * restaurado continúe generando matchIds deterministas y sin
  * colisiones.
  *
+ * Anclaje cruzado (Sprint 03.5): lee el hash SHA-256 de la fila
+ * `lastSequence` de events_log y lo guarda como `wal_anchor_hash`; el
+ * `state_hash` se calcula sobre ancla + secuencia + estado. Un WAL que
+ * avance o se altere después del snapshot desacopla el ancla y el
+ * replay descarta el snapshot (fallback a replay limpio).
+ *
  * Complejidad: O(M log M) por el ordenamiento determinista de órdenes.
  */
 export function takeSnapshot(
@@ -78,6 +109,18 @@ export function takeSnapshot(
   db: Database.Database,
   lastSequence: bigint,
 ): string {
+  // Ancla criptográfica: hash del último evento cubierto por el snapshot.
+  const anchorRow = db
+    .prepare("SELECT hash FROM events_log WHERE sequence = ?")
+    .get(Number(lastSequence)) as { hash: string } | undefined;
+  if (anchorRow === undefined || anchorRow.hash === "") {
+    throw new SnapshotError(
+      `takeSnapshot: no hay evento ${lastSequence} en events_log para anclar ` +
+        `(o su hash está vacío)`,
+    );
+  }
+  const walAnchorHash = anchorRow.hash;
+
   const internals = internalsOf(engine);
   const orders = [...internals._orderMap.values()]
     .map((entry) => entry.order)
@@ -86,13 +129,14 @@ export function takeSnapshot(
     orders,
     matchCounter: internals._matchCounter,
   });
-  const stateHash = createHash("sha256").update(stateData).digest("hex");
+  const stateHash = computeSnapshotStateHash(walAnchorHash, lastSequence, stateData);
 
   const snapshotId = randomUUID();
   db.prepare(
-    `INSERT INTO snapshots (snapshot_id, last_sequence, state_data, state_hash, created_at)
-     VALUES (?, ?, ?, ?, (unixepoch() * 1000))`,
-  ).run(snapshotId, Number(lastSequence), stateData, stateHash);
+    `INSERT INTO snapshots
+       (snapshot_id, last_sequence, state_data, state_hash, wal_anchor_hash, created_at)
+     VALUES (?, ?, ?, ?, ?, (unixepoch() * 1000))`,
+  ).run(snapshotId, Number(lastSequence), stateData, stateHash, walAnchorHash);
 
   db.prepare(
     `DELETE FROM snapshots
@@ -110,7 +154,7 @@ export function takeSnapshot(
 export function getLatestSnapshot(db: Database.Database): StoredSnapshot | null {
   const row = db
     .prepare(
-      "SELECT snapshot_id, last_sequence, state_data, state_hash FROM snapshots ORDER BY last_sequence DESC LIMIT 1",
+      "SELECT snapshot_id, last_sequence, state_data, state_hash, wal_anchor_hash FROM snapshots ORDER BY last_sequence DESC LIMIT 1",
     )
     .get() as
     | {
@@ -118,6 +162,7 @@ export function getLatestSnapshot(db: Database.Database): StoredSnapshot | null 
         last_sequence: number;
         state_data: string;
         state_hash: string;
+        wal_anchor_hash: string;
       }
     | undefined;
 
@@ -129,6 +174,7 @@ export function getLatestSnapshot(db: Database.Database): StoredSnapshot | null 
     lastSequence: BigInt(row.last_sequence),
     stateData: row.state_data,
     stateHash: row.state_hash,
+    walAnchorHash: row.wal_anchor_hash,
   };
 }
 
@@ -173,4 +219,17 @@ export function restoreEngineState(engine: MatchingEngine, stateData: string): v
   // Continuidad determinista: el motor restaurado retoma el contador
   // de matches sin reutilizar matchIds (el histórico vive en el WAL).
   internals._matchCounter = state.matchCounter;
+}
+
+/**
+ * Devuelve un motor a estado virgen (usado por el replay en el fallback
+ * limpio cuando el snapshot se descarta por ancla desacoplada).
+ */
+export function resetEngineState(engine: MatchingEngine): void {
+  const internals = internalsOf(engine);
+  internals._bids = { levels: new Map(), prices: [] };
+  internals._asks = { levels: new Map(), prices: [] };
+  internals._orderMap = new Map();
+  internals._trades = [];
+  internals._matchCounter = 0;
 }
