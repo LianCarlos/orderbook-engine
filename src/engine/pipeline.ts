@@ -35,6 +35,12 @@ export interface ExecuteOrderOptions {
   holdAsset?: string;
 }
 
+/** Resultado del pipeline: MatchResult + secuencia WAL de la orden. */
+export interface PipelineExecutionResult extends MatchResult {
+  /** Secuencia de fila WAL del ORDER_NEW de esta orden (clave de correlación del stream). */
+  walSequence: bigint;
+}
+
 interface SideBookInternals {
   levels: Map<bigint, LimitLevel>;
   prices: bigint[];
@@ -93,7 +99,10 @@ export class ExecutionPipeline {
    * liquidación + releases) en UNA transacción SQLite. Ante cualquier
    * excepción, revierte el SQL y restaura el estado en RAM.
    */
-  executeOrder(order: Order, options: ExecuteOrderOptions = {}): MatchResult {
+  executeOrder(
+    order: Order,
+    options: ExecuteOrderOptions = {},
+  ): PipelineExecutionResult {
     const holdAsset =
       options.holdAsset ?? (order.side === "BUY" ? this._quoteAsset : this._baseAsset);
     const holdAmount = options.holdAmount ?? this._defaultHoldAmount(order);
@@ -103,10 +112,11 @@ export class ExecutionPipeline {
     const loggerCapture = this._logger.captureState();
 
     let result: MatchResult | undefined;
+    let walSequence = 0n;
     try {
       this._db.transaction(() => {
         // 1. WAL: evento de ingreso (append directo dentro de la transacción).
-        const walSequence = this._logger.appendEvent("ORDER_NEW", order);
+        walSequence = this._logger.appendEvent("ORDER_NEW", order);
 
         // 2. Bloqueo inicial de fondos.
         if (holdAmount > 0n) {
@@ -147,7 +157,7 @@ export class ExecutionPipeline {
           }
         }
       })();
-      return result as MatchResult;
+      return { ...(result as MatchResult), walSequence };
     } catch (err) {
       // Reversión de RAM: SQLite ya revirtió; restauramos motor, ledger
       // y logger (secuencia y hash chain) al snapshot previo.

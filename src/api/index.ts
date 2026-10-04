@@ -1,6 +1,7 @@
 /**
- * API layer: Next.js Route Handlers and WebSocket/SSE streaming for
- * L2/L3 market data.
- * Full implementation lands in later sprints.
+ * API layer: BigInt-safe DTO serializer, L2 depth aggregation and
+ * real-time streaming (SSE/HTTP + in-process hub).
  */
-export {};
+export * from "./serializer";
+export * from "./depth";
+export * from "./server";
