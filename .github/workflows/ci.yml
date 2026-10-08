@@ -19,13 +19,69 @@ jobs:
           node-version: 22
           cache: npm
 
+      # Paso 1: instala dependencias exactas del lockfile.
       - name: Install dependencies
         run: npm ci
 
+      # Paso 2: verificación estricta de tipos.
       - name: Typecheck
         run: npx tsc --noEmit
 
+      # Paso 3: linter.
       - name: Lint
         run: npm run lint
 
-  # NOTE: Sprint 05 añadirá el job de benchmarks (scripts/benchmark.mjs).
+  test-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Paso 4: suite de validación integrada (Sprints 00 → 05).
+      # Cada script es determinista (seeds fijos) y sale con código 0/1.
+      - name: Sprint validation suite (00 → 05)
+        run: |
+          node scripts/test-sprint-00.mjs
+          node scripts/test-sprint-01.mjs
+          node scripts/test-sprint-02.mjs
+          node scripts/test-sprint-02-hardening.mjs
+          node scripts/test-sprint-03.mjs
+          node scripts/test-sprint-03-hardening.mjs
+          node scripts/test-sprint-04.mjs
+
+  benchmark:
+    runs-on: ubuntu-latest
+    needs: typecheck-and-lint
+    # Informativo: la baseline absoluta depende del hardware del runner;
+    # el reporte queda en bench-results.json (artefacto).
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Benchmark (carga reducida de CI)
+        run: node --expose-gc scripts/benchmark.mjs --orders 20000
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results.json

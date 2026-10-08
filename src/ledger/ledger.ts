@@ -206,12 +206,21 @@ export class SettlementLedger {
    * sintética (liability) vive solo en el journal.
    */
   deposit(userId: string, asset: string, amount: bigint): void {
+    this._commitPlanned(this._planDeposit(userId, asset, amount));
+  }
+
+  /** Variante cruda para el pipeline/benchmarks (ver holdFundsRaw). */
+  depositRaw(userId: string, asset: string, amount: bigint): void {
+    this._commitPlannedRaw(this._planDeposit(userId, asset, amount));
+  }
+
+  private _planDeposit(userId: string, asset: string, amount: bigint): PlannedOp {
     if (amount <= 0n) {
       throw new BalanceOverflowError(
         `deposit inválido para ${userId} en ${asset}: ${amount.toString()}`,
       );
     }
-    this._commitPlanned({
+    return {
       entries: [
         { accountId: userId, accountType: "AVAILABLE", asset, side: "DEBIT", amount },
         { accountId: EXTERNAL_ACCOUNT_ID, accountType: "AVAILABLE", asset, side: "CREDIT", amount },
@@ -219,7 +228,7 @@ export class SettlementLedger {
       orderId: null,
       matchId: null,
       after: () => {},
-    });
+    };
   }
 
   /**
