@@ -122,7 +122,8 @@ orderbook-engine/
 | `start` | `next start` | Sirve el build de producción, bind a `localhost` por defecto. |
 | `lint` | `eslint .` | Linting del proyecto con ESLint 9 (config flat de Next 16). |
 | `tsc` | `tsc --noEmit` | Verificación de tipos estricta, sin emitir. |
-| `bench` | `node scripts/benchmark.mjs` | Entrypoint de la suite de benchmarks standalone (órdenes/seg, p99, replay de 1M eventos) sin arrancar Next.js; placeholder que se implementa por completo en SPRINT_05. |
+| `test` | `npm test` | Encadena las 7 suites de validación: `test-sprint-00`, `01`, `02`, `02-hardening`, `03`, `03-hardening` y `04`. |
+| `bench` | `node --expose-gc scripts/benchmark.mjs` | Entrypoint de la suite de benchmarks standalone (órdenes/seg, p99, replay de 1M eventos) sin arrancar Next.js; placeholder que se implementa por completo en SPRINT_05. |
 
 ---
 

@@ -6,8 +6,9 @@
  *
  * Prueba 1 · Fast Recovery:
  *   20,000 eventos con hash chain SHA-256; snapshot a los 15,000.
- *   Crash simulado y medición: snapshot + delta debe ser al menos 3x
- *   más rápido que el replay completo, con estado bit a bit idéntico.
+ *   Crash simulado y medición robusta (1 warmup + mediana de 3 ratios):
+ *   snapshot + delta debe ser al menos 3x más rápido que el replay
+ *   completo, con estado bit a bit idéntico.
  *
  * Prueba 2 · Tamper Detection:
  *   UPDATE malicioso directo sobre el payload de la fila 500.
@@ -294,16 +295,15 @@ function main() {
     engineSnap = null;
 
     // ── Prueba 1 · Fast Recovery ─────────────────────────────────────
+    // Verificación funcional (independiente de la medición temporal): un
+    // único replay por vía para validar eventos, estado canónico y
+    // matchCounter. No se cronometra: la medición robusta va aparte.
     const freshFull = new MatchingEngine();
-    const t0 = performance.now();
     const fullResult = replayState(dbFull, freshFull);
-    const tFull = performance.now() - t0;
     assert.equal(fullResult.replayedEvents, TOTAL_EVENTS);
 
     const freshSnap = new MatchingEngine();
-    const t1 = performance.now();
     const snapResult = replayState(dbSnap, freshSnap);
-    const tSnap = performance.now() - t1;
     assert.equal(
       snapResult.replayedEvents,
       TOTAL_EVENTS - SNAPSHOT_AT,
@@ -336,11 +336,83 @@ function main() {
     );
     assert.equal(freshFull._matchCounter, controlMatchCounter);
 
-    const speedup = tFull / tSnap;
+    /**
+     * Medición temporal robusta de Fast Recovery (warmup + 3 muestras).
+     *
+     * · 1 iteración de warmup DESCARTADA: calienta JIT y page cache de
+     *   SQLite, eliminando el sesgo de la primera ejecución.
+     * · 3 muestras medidas: cada una crea un `MatchingEngine` virgen y
+     *   hace replay sobre las DBs ya preparadas (no se recrean DBs).
+     *
+     * Estadístico: MEDIANA DE LOS 3 RATIOS (tFull/tSnap) por muestra.
+     * Motivo: el assert compara directamente un ratio y cada ratio se
+     * calcula dentro de la misma muestra (ambas mediciones próximas en
+     * el tiempo), así un outlier de fsync/JIT en una vía solo contamina
+     * su propio ratio y la mediana lo descarta. Frente a
+     * mediana(tFull)/mediana(tSnap), evita emparejar outliers de
+     * muestreos distintos. Con 3 muestras la mediana es el valor
+     * central, robusto a 1 muestra anómala.
+     */
+    function measureFastRecoverySpeedup() {
+      const runSample = () => {
+        const sampleEngineFull = new MatchingEngine();
+        const startFull = performance.now();
+        const sampleFull = replayState(dbFull, sampleEngineFull);
+        const sampleTFull = performance.now() - startFull;
+
+        const sampleEngineSnap = new MatchingEngine();
+        const startSnap = performance.now();
+        const sampleSnap = replayState(dbSnap, sampleEngineSnap);
+        const sampleTSnap = performance.now() - startSnap;
+
+        // Salvaguarda: cada muestra debe recorrer las mismas rutas.
+        assert.equal(sampleFull.replayedEvents, TOTAL_EVENTS);
+        assert.equal(
+          sampleSnap.replayedEvents,
+          TOTAL_EVENTS - SNAPSHOT_AT,
+          "con snapshot solo se re-aplica el delta",
+        );
+
+        return {
+          tFull: sampleTFull,
+          tSnap: sampleTSnap,
+          speedup: sampleTFull / sampleTSnap,
+        };
+      };
+
+      runSample(); // warmup descartado
+
+      const samples = [];
+      for (let i = 0; i < 3; i++) {
+        samples.push(runSample());
+      }
+
+      const median = (values) => {
+        const sorted = [...values].sort((a, b) => a - b);
+        return sorted[Math.floor(sorted.length / 2)];
+      };
+
+      return {
+        tFull: median(samples.map((s) => s.tFull)),
+        tSnap: median(samples.map((s) => s.tSnap)),
+        speedup: median(samples.map((s) => s.speedup)),
+        samples,
+      };
+    }
+
+    const {
+      tFull,
+      tSnap,
+      speedup,
+      samples: speedupSamples,
+    } = measureFastRecoverySpeedup();
+
     assert.ok(
       speedup >= MIN_SPEEDUP,
-      `fast recovery ${speedup.toFixed(2)}x < umbral ${MIN_SPEEDUP}x ` +
-        `(completo=${tFull.toFixed(2)} ms, snapshot+delta=${tSnap.toFixed(2)} ms)`,
+      `fast recovery ${speedup.toFixed(2)}x (mediana de ` +
+        `${speedupSamples.length} ratios) < umbral ${MIN_SPEEDUP}x ` +
+        `(mediana completo=${tFull.toFixed(2)} ms, ` +
+        `mediana snapshot+delta=${tSnap.toFixed(2)} ms)`,
     );
 
     // ── Prueba 2 · Tamper Detection ──────────────────────────────────
@@ -402,12 +474,19 @@ function main() {
     );
     console.log(`Snapshot .............. sequence ${SNAPSHOT_AT} (retención 3 ✓)`);
     console.log("── Prueba 1 · Fast Recovery ──");
-    console.log(`  Replay completo ..... ${TOTAL_EVENTS} eventos en ${tFull.toFixed(2)} ms`);
     console.log(
-      `  Snapshot + delta .... ${TOTAL_EVENTS - SNAPSHOT_AT} eventos en ${tSnap.toFixed(2)} ms`,
+      `  Replay completo ..... ${TOTAL_EVENTS} eventos · mediana ${tFull.toFixed(2)} ms`,
     );
     console.log(
-      `  Speedup ............. ${speedup.toFixed(2)}x (umbral: ≥ ${MIN_SPEEDUP}x) ✓`,
+      `  Snapshot + delta .... ${TOTAL_EVENTS - SNAPSHOT_AT} eventos · mediana ${tSnap.toFixed(2)} ms`,
+    );
+    console.log(
+      `  Speedup ............. ${speedup.toFixed(2)}x (mediana de ${speedupSamples.length} ratios; umbral: ≥ ${MIN_SPEEDUP}x) ✓`,
+    );
+    console.log(
+      `  Muestras ............ ${speedupSamples
+        .map((s) => `${s.speedup.toFixed(2)}x`)
+        .join(" · ")} (1 warmup descartado)`,
     );
     console.log(`  Estado reconstruido . bit a bit idéntico ✓ (${depthSummary.liveOrders} órdenes vivas)`);
     console.log("── Prueba 2 · Tamper Detection ──");
