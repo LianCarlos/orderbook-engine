@@ -24,6 +24,16 @@ compilable (`npx tsc --noEmit` limpio), tests en verde y documentación actualiz
 | `SPRINT_04` | L2 Orderbook Streaming API | Sprint 03 | SSE/WebSocket de profundidades, visual Next.js |
 | `SPRINT_05` | Benchmark Suite, Polish & CI | Sprint 04 | órdenes/seg, p99, gate de CI |
 
+## Resumo (pt-BR)
+
+- **SPRINT_00 — Setup & Core Data Structures:** contrato de tipos e estruturas núcleo do livro, com best bid/ask em O(1), níveis de preço em O(log N) e fila FIFO O(1) por nível.
+- **SPRINT_01 — Matching Engine Core:** calce `LIMIT`/`MARKET`/`CANCEL` com `GTC`/`IOC` e emissão de eventos deterministas que alimentam o WAL.
+- **SPRINT_02 — WAL Persistence & State Replay:** WAL append-only sobre SQLite, hash chain `SHA-256`, replay determinista e snapshot ancorado.
+- **SPRINT_03 — Double-Entry Settlement Ledger:** reserva de fundos Maker/Taker e liquidação atômica de cada `Trade` com invariante Σ débitos = Σ créditos.
+- **SPRINT_04 — L2 Orderbook Streaming API:** API de ingresso, streaming L2/L3 via SSE e visualização Next.js em tempo real.
+- **SPRINT_05 — Benchmark Suite, Polish & CI:** throughput (ordens/seg), latência p99, baseline documentada e gate de CI contra regressões.
+- **Estado geral:** roadmap 🔒 congelado (frozen); qualquer mudança de escopo exige revisão do CTO e cada sprint integra a `main` via PR individual com revisão de arquitetura.
+
 ## Definition of Done (global, aplica a todos los sprints)
 
 1. `npx tsc --noEmit` pasa limpio (TypeScript estricto).

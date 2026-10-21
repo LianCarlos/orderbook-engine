@@ -1,6 +1,6 @@
 # Arquitectura — High-Throughput In-Memory Orderbook & Matching Engine
 
-> **Estado del documento:** borrador de diseño pre-implementación (scaffolding congelado). Todo lo descrito es el objetivo de arquitectura acordado; se verificará contra el código a medida que cada sprint se complete.
+> **Estado del documento:** implementado y verificado (2026-10-21) por las suites `test-sprint-00` … `test-sprint-04`, incluidos los hardening `test-sprint-02-hardening` (hash chain) y `test-sprint-03-hardening` (anclaje de snapshots y atomicidad del ledger). Este documento describe el comportamiento real del código. El modelo de amenazas e integridad está en [`docs/SECURITY.md`](./SECURITY.md) y la baseline empírica de rendimiento en [`docs/PERFORMANCE.md`](./PERFORMANCE.md).
 
 ## 1. Visión general
 
@@ -20,18 +20,18 @@ flowchart TD
     IO["Ingress Order / Cancel"] --> VAL{"Valid? zod"}
     VAL -->|"invalid: 4xx reject"| REJ["Rejected"]
     VAL -->|"CANCEL"| RM["Order Book Remove"]
-    RM -->|"order_cancelled"| W1["WAL Append"]
+    RM -->|"ORDER_CANCEL"| W1["WAL Append"]
     W1 --> B1["L2 Broadcast"]
     VAL -->|"cross: LIMIT / MARKET"| MM["In-Memory Match"]
-    MM -->|"order_matched, funds_reserved, funds_settled"| W2["WAL Append"]
+    MM -->|"ORDER_NEW + TRADE_MATCH (uno por trade)"| W2["WAL Append"]
     W2 --> LS["Ledger Settle"]
     LS --> B2["L2 Broadcast"]
     VAL -->|"no cross: LIMIT"| INSB["Order Book Insert"]
-    INSB -->|"order_placed"| W3["WAL Append"]
+    INSB -->|"ORDER_NEW"| W3["WAL Append"]
     W3 --> B3["L2 Broadcast"]
 ```
 
-Cada comando (orden o cancelación) es **una transacción SQLite**: los eventos se escriben en el log y los movimientos del ledger se aplican dentro del mismo `BEGIN IMMEDIATE ... COMMIT`. El broadcast L2 ocurre solo después del commit, por lo que ningún consumidor observa estado no persistido. El evento `order_matched` se descompone en su serie `funds_reserved` → `funds_settled` según el ciclo Maker/Taker (ver §5).
+Cada comando (orden o cancelación) es **una transacción SQLite**: los eventos se escriben en el log y los movimientos del ledger se aplican dentro del mismo `BEGIN IMMEDIATE ... COMMIT`. El broadcast L2 ocurre solo después del commit, por lo que ningún consumidor observa estado no persistido. El WAL solo registra los tres tipos de §4.1: `ORDER_NEW` (ingreso), un `TRADE_MATCH` por trade y `ORDER_CANCEL` (cancelación). La retención de fondos (`holdFunds`) y la liquidación (`settleTrade`) son movimientos del ledger dentro de esa misma transacción, no eventos del log (ver §5).
 
 ## 3. Análisis de complejidad (foco del documento)
 
@@ -80,48 +80,57 @@ Cada comando (orden o cancelación) es **una transacción SQLite**: los eventos 
 
 ### 4.1 Formato de eventos
 
-Los eventos se almacenan en una tabla inmutable (solo `INSERT`; triggers rechazan `UPDATE`/`DELETE`):
+Los eventos se persisten en la tabla `events_log` (esquema en `src/storage/db.ts`) y solo se escriben mediante `INSERT`. **No existen triggers anti-`UPDATE`/`DELETE` en `events_log`**: la manipulación directa se detecta por la hash chain al hacer replay (§4.2).
 
 | Campo | Tipo | Nota |
 |---|---|---|
-| `seq` | integer PK | Secuencia monotónica global |
-| `event_type` | text | `order_placed`, `order_matched`, `order_cancelled`, `funds_reserved`, `funds_settled` (con `CHECK`) |
-| `payload` | text (JSON) | Validado con zod al escribir y al leer |
-| `checksum` | text | Checksum del registro (por ejemplo CRC32C sobre `seq + event_type + payload`) |
-| `created_at` | integer | Metadato logístico del servidor (permitido: **no** participa en la reconstrucción del estado) |
+| `sequence` | `BIGINT PRIMARY KEY` | Secuencia monotónica global asignada por `WalLogger` (sin `AUTOINCREMENT`). |
+| `event_type` | `TEXT NOT NULL` | `ORDER_NEW`, `ORDER_CANCEL`, `TRADE_MATCH`. Sin `CHECK`: el replay rechaza cualquier otro valor con `UnknownEventTypeError`. |
+| `payload` | `TEXT NOT NULL` | JSON serializado de forma determinista (bigint → string; claves bigint del dominio acotadas). |
+| `prev_hash` | `TEXT NOT NULL` | Hash SHA-256 de la fila anterior; default `GENESIS_HASH` (64 ceros hexadecimales). |
+| `hash` | `TEXT NOT NULL` | SHA-256 de esta fila (preimagen en §4.2); las filas legacy quedan con `''`. |
+| `created_at` | `INTEGER NOT NULL` | `DEFAULT (unixepoch() * 1000)` aplicado por SQLite; metadato logístico que **no** participa en la reconstrucción del estado. |
 
-### 4.2 Append-only con checksum
+### 4.2 Append-only con hash chain SHA-256
 
-- Cada registro lleva checksum; cada segmento/periodicidad de compactación puede sumar un checksum agregado (hash del rango de eventos) para detectar corrupción temprana.
-- No hay edición ni borrado: corregir historia está prohibido; ante corrupción se trunca desde el último snapshot válido (ver `docs/SECURITY.md`).
+- **Preimagen canónica:** `hash = SHA256(sequence|prev_hash|event_type|payload)`. `WalLogger` la calcula con `computeEventHash` y `replayState` la recalcula con `writeEventHashInput`, el punto único de verdad del formato. El `payload` entra **exactamente** como el string JSON persistido (serialización determinista, bigint → string).
+- **Génesis:** el primer evento de un WAL vacío enlaza con `GENESIS_HASH` (64 ceros hexadecimales).
+- **Filas legacy:** un `hash` vacío (`''`, filas anteriores a Sprint 02.5) se trata como cadena rota — fail-closed; nunca se acepta silenciosamente.
+- **Detección de tamper:** modificar `payload`, `event_type`, `sequence` o `hash` rompe la cadena y el replay lanza `WalCorruptionError` (`kind: "prev_hash"` o `kind: "hash"`) con la secuencia exacta de la fila ofensora. La restauración **aborta**; no se repara in-place ni se reescribe historia.
+- **No implementado:** no hay checksum por segmento ni archivos de segmento; el único checksum es la hash chain por evento.
 
-### 4.3 Snapshot + compaction
+### 4.3 Snapshot anclado y recuperación
 
-- Periódicamente (por tamaño de log o número de eventos) se escribe un **snapshot** del estado en memoria junto con el hash de ese estado y el `seq` al que corresponde.
-- **Compaction:** los eventos anteriores al último snapshot se pueden archivar/eliminar porque el estado ya está resumido.
-- Replay = cargar snapshot + re-ejecutar los eventos con `seq > snapshot.seq`.
+- El snapshot congela el libro (`bids`/`asks` y órdenes vivas en orden Price-Time) y el `matchCounter`; el histórico de trades no se congela (su fuente de verdad es el WAL/ledger). `takeSnapshot` se invoca explícitamente y persiste en la tabla `snapshots` (`src/storage/snapshot.ts`).
+- **Integridad:** cada snapshot guarda `state_hash = SHA256(wal_anchor_hash + last_sequence + state_data)` y `wal_anchor_hash` (el `hash` SHA-256 de la fila `events_log.last_sequence` cubierta).
+- **Verificación antes de restaurar:** el replay recalcula `state_hash`; una discrepancia lanza `SnapshotCorruptionError` y aborta. Si el `wal_anchor_hash` no coincide con el hash real de la fila en el WAL (o la fila no existe), lanza `SnapshotAnchorMismatchError`, descarta el snapshot y fuerza replay limpio desde el evento 0.
+- **Retención:** `MAX_SNAPSHOTS = 3`; cada nuevo snapshot elimina los más antiguos por `last_sequence` y `created_at`.
+- Replay con snapshot = restaurar el estado + re-aplicar los eventos con `sequence > last_sequence`.
+- **No implementado (roadmap):** no hay compaction ni archivado/eliminación de eventos anteriores al snapshot; `events_log` crece indefinidamente más allá de la retención de snapshots.
 
 ### 4.4 Replay determinista en arranque
 
-- El replay re-ejecuta el log en orden estricto de `seq` y reconstruye libro + ledger + niveles L2.
+- El replay re-ejecuta el log en orden estricto de `sequence` y reconstruye el estado del **libro** (bids/asks, índice de cancelación y `matchCounter`). No re-aplica asientos del ledger ni re-emite eventos: `TRADE_MATCH` se audita en la cadena pero no se re-ejecuta, porque los trades se regeneran al re-aplicar los `ORDER_NEW`.
 - Reglas de oro:
   - **Prohibido `Date.now()` o `Math.random()` dentro del payload de eventos** o de cualquier cálculo que afecte el estado reconstruido.
-  - IDs de orden derivados del `sequence` (no UUID aleatorios dentro del hot path).
+  - `matchId` monotónico del motor (`match-1`, `match-2`, …) derivado del `matchCounter`, que el snapshot restaura para evitar colisiones; los `orderId` los aporta el caller.
   - Precios y cantidades en **enteros de escala fija** (nunca `number` con punto flotante para dinero).
-  - Verificación post-replay: hash del estado reconstruido vs hash guardado en el snapshot (detección de deriva no determinista).
+  - **Verificación real:** auditoría incondicional de la hash chain fila a fila durante el replay (aborta con error tipado) y comparación canónica bit a bit del estado reconstruido contra el estado de control en las suites de hardening, no un hash de estado calculado post-replay.
 
 ### 4.5 Transacciones SQLite
 
-- Un comando = una transacción (`BEGIN IMMEDIATE`): inserción de los eventos del comando + aplicación de movimientos del ledger + actualización de snapshot si corresponde + `COMMIT`. Cualquier fallo → `ROLLBACK` total, sin efectos parciales observables.
+- Un comando = una transacción (`BEGIN IMMEDIATE`): inserción de los eventos del comando + aplicación de movimientos del ledger + `COMMIT`. Cualquier fallo → `ROLLBACK` total, sin efectos parciales observables.
+- Los snapshots quedan **fuera** del pipeline del comando: `takeSnapshot` se invoca de forma explícita con la última `sequence` ya persistida y escribe en la tabla `snapshots`; no hay creación implícita de snapshots por orden ni por cancelación.
 - `journal_mode=WAL` y `synchronous=NORMAL` para durabilidad y concurrencia razonables sin bloquear el motor.
 
 ## 5. Ledger de doble entrada
 
-- **Invariante:** en todo momento y para cada cuenta, Σ débitos = Σ créditos (equivalente: balance de cada cuenta ≥ 0 por constraint; la suma global de variaciones es cero).
-- **Reserva antes de match:** al colocar una orden que requiere fondos, los fondos se reservan (`funds_reserved`); los Makers ya tienen reserva activa. El Taker reserva antes de calzar. Sin reserva completa no hay match.
-- **Liquidación atómica:** la serie `funds_settled` materializa los débitos/créditos Maker/Taker dentro de la misma transacción del match; el ledger se actualiza con `INSERT` de movimientos (immutable) y actualización de balances.
-- **Rollback ante fallo parcial:** si cualquier paso falla (fondos insuficientes, constraint violada, error de escritura), la transacción se aborta completa: el libro queda como antes y la orden entrante se rechaza sin efectos.
-- Red de seguridad: constraints SQLite (`CHECK balance >= 0`, FK de cuentas, uniqueness de referencias) que hacen **imposible** un ledger inconsistente aunque el código falle (detalle en `docs/SECURITY.md`).
+- **Invariante:** por cada transacción (`tx_id`) y asset, Σ débitos = Σ créditos. `SettlementLedger.audit()` lo verifica sobre `journal_entries` y además compara el neto del journal contra los saldos en memoria: `unbalancedTransactions` y `memoryMismatches` deben ser 0.
+- **Saldos en memoria:** el `SettlementLedger` mantiene `userId → asset → account_type` en `Map` con `bigint`. Fondos insuficientes, montos ≤ 0 o un release excesivo lanzan `BalanceOverflowError` antes de persistir; un descuadre lanza `UnbalancedTransactionError`. **No existe tabla `accounts` ni `CHECK (balance >= 0)`** en SQLite.
+- **Retención antes del match:** `holdFunds` mueve AVAILABLE → LOCKED al aceptar la orden; el taker retiene antes de calzar. Sin retención completa la orden se rechaza.
+- **Liquidación atómica:** `settleTrade` registra los asientos Maker/Taker de base y quote (con comisiones opcionales a `FEE_VAULT`) en `journal_entries`, dentro de la misma transacción SQLite que el WAL y el calce.
+- **Rollback ante fallo parcial:** una excepción revierte la transacción SQL completa y el `ExecutionPipeline` restaura motor, ledger y logger desde la captura previa: no quedan débitos sin crédito ni secuencias consumidas.
+- **Red de seguridad en SQLite** (detalle en `docs/SECURITY.md` §7): `CHECK (account_type IN ('AVAILABLE','LOCKED','FEE_VAULT'))`, `CHECK (side IN ('DEBIT','CREDIT'))` y `CHECK (amount > 0)` en `journal_entries`; PK de `settled_trades.match_id` (impide liquidar dos veces el mismo match); triggers `BEFORE UPDATE`/`BEFORE DELETE` con `RAISE(ABORT)` en `journal_entries` y `settled_trades`. Esos triggers **no** aplican a `events_log`.
 
 ## 6. Streaming L2/L3
 

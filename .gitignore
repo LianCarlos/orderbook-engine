@@ -15,8 +15,6 @@ build/
 *.pem
 
 # env
-.env
-.env.local
 .env*.local
 
 # databases
@@ -30,3 +28,7 @@ bench-results.json
 
 # typescript
 *.tsbuildinfo
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+config.bat

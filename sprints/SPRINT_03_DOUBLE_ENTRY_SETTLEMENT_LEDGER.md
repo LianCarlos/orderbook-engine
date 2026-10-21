@@ -7,6 +7,15 @@
 | Rama sugerida | `sprint/03-settlement-ledger` |
 | Propietario | 🗃️ sqlite-dev + ⚛️ nextjs-dev |
 
+## Resumo Executivo (pt-BR)
+
+- **Objetivo:** implementar o motor de saldos de dupla entrada que reserva fundos ao aceitar uma ordem (Maker/Taker balance locking) e liquida atomicamente cada `Trade`, mantendo o invariante contábil em qualquer circunstância.
+- **Entregáveis:** `accounts.ts` (`available`/`reserved`/`total`), `journal.ts` (débito e crédito por operação), `reservation.ts` (bloqueio e liberação de fundos) e `settlement.ts` (liquidação atômica por `Trade`), em `src/ledger/`, integrados ao pipeline do motor.
+- **Critérios de aceite:** Σ débitos = Σ créditos para suítes determinísticas e aleatórias com seed fixo; reserva insuficiente → rejeição **antes** de tocar o livro; cancelamento libera a reserva exata; rollback sem saldos inconsistentes; overflow/underflow de saldos com BigInt ou checagem de faixa.
+- **Atomicidade:** settlement + WAL append na mesma transação SQLite (nada persiste se o outro falhar); cada lançamento referencia a `sequence` do evento que o originou.
+- **Verificação:** `npx tsc --noEmit`, `npm run lint` e `npm test -- ledger`.
+- **Status:** 🔒 spec congelada (frozen).
+
 ## 1. Objetivo
 
 Implementar el motor de saldos de **doble entrada** que reserva fondos al aceptar

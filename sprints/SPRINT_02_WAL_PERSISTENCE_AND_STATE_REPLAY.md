@@ -7,6 +7,15 @@
 | Rama sugerida | `sprint/02-wal-persistence` |
 | Propietario | 🗃️ sqlite-dev + ⚛️ nextjs-dev |
 
+## Resumo Executivo (pt-BR)
+
+- **Objetivo:** persistir todos os eventos do motor em um WAL append-only sobre SQLite (`better-sqlite3`) e garantir a reconstrução determinística do livro no boot via replay de eventos, incluindo snapshot.
+- **Entregáveis:** `client.ts` (singleton em `globalThis`), `schema.ts` + migrações `drizzle-orm` (tabelas `events` e `snapshots`), `wal.ts` (append atômico com `checksum`, `sequence` e `prevSequence`), `replay.ts` e `snapshot.ts`, em `src/storage/`.
+- **Critérios de aceite:** replay de 10k eventos gera estado idêntico ao livro ao vivo; cadeia rota (checksum inválido ou lacuna de `sequence`) detectada com erro claro; reinício simulado (novo processo → mesma DB) reconstrói o livro; crash-safety sem contaminar o WAL.
+- **Determinismo:** `payload` sem timestamps de relógio e sem aleatoriedade; replay em uma única passada, O(E) com E eventos.
+- **Verificação:** `npx tsc --noEmit`, `npm run lint` e `npm test -- storage`.
+- **Status:** 🔒 spec congelada (frozen).
+
 ## 1. Objetivo
 
 Persistir todos los eventos del motor en un **Write-Ahead Log** append-only sobre
