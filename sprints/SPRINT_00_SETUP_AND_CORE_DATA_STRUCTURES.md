@@ -7,6 +7,14 @@
 | Rama sugerida | `sprint/00-core-data-structures` |
 | Propietario | ⚛️ nextjs-dev + 🧪 qa-tester |
 
+## Resumo Executivo (pt-BR)
+
+- **Objetivo:** definir o contrato de tipos do domínio e as estruturas de dados núcleo do livro de ordens em TypeScript estrito, garantindo desde o primeiro dia best bid/ask em O(1), níveis de preço em O(log N) e fila FIFO por nível em O(1).
+- **Entregáveis:** `types.ts`, `price-time.ts`, `levels.ts`, `orderbook.ts` e `validation.ts` em `src/core/`, com testes unitários do domínio e um property-based básico de sequências válidas de preços.
+- **Critérios de aceite:** `tsc --noEmit` limpo com `strict: true`; best bid/ask atualizado corretamente ao esvaziar um nível; um nível com N ordens percorrido na ordem exata de chegada.
+- **Verificação:** `npx tsc --noEmit`, `npm run lint` e `npm test -- core`.
+- **Status:** 🔒 spec congelada (frozen). Emendas aprovadas na §7: `Order.sequence: bigint` obrigatório, `OrderType` sem `CANCEL` e dívida de encapsulamento/runner `tsx` transferida ao Sprint 01.
+
 ## 1. Objetivo
 
 Definir el contrato de tipos del dominio y las estructuras de datos núcleo del libro

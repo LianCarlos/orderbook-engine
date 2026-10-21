@@ -7,6 +7,15 @@
 | Rama sugerida | `sprint/04-l2-streaming` |
 | Propietario | ⚛️ nextjs-dev + 🎨 ui-designer |
 
+## Resumo Executivo (pt-BR)
+
+- **Objetivo:** expor o livro em tempo real: API local de ingresso de ordens (Route Handlers), streaming **L2** (profundidade agregada por preço) e **L3** (ordem a ordem) via SSE/WebSocket, e uma interface Next.js 16 de visualização ao vivo.
+- **Entregáveis:** `routes.ts` (`POST /api/orders`, `GET /api/book/snapshot`, `DELETE /api/orders/:id`), `broadcast.ts` (hub de assinantes com backpressure), `stream.ts` (SSE `/api/stream/l2` e `/api/stream/l3`, protocolo snapshot + deltas) e `reconcile.ts`, em `src/api/`; página do livro em `src/app/`.
+- **Critérios de aceite:** fluxo end-to-end (POST ordem → match → delta SSE → UI atualizada); latência de broadcast p99 ≤ 10 ms (medida no Sprint 05); `npx tsc --noEmit` limpo.
+- **Propriedades:** snapshot + sequência de deltas reconstrói o livro exato; zod rejeita ordens malformadas com 400 tipado; cliente SSE reconecta e ressincroniza após desconexão.
+- **Verificação:** `npx tsc --noEmit`, `npm run lint`, `npm test -- api` e `npm run dev` para a verificação manual da visualização.
+- **Status:** 🔒 spec congelada (frozen). Streaming local (bind em localhost), com rate limiting básico e sem autenticação; L3 expõe apenas o livro público, sem `traderId` no payload.
+
 ## 1. Objetivo
 
 Exponer el libro en tiempo real: API local de ingreso de órdenes (Route Handlers),

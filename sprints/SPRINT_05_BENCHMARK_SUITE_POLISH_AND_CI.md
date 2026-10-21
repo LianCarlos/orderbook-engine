@@ -7,6 +7,15 @@
 | Rama sugerida | `sprint/05-benchmark-ci` |
 | Propietario | ⚛️ nextjs-dev + 🧪 qa-tester + 🔀 integrator |
 
+## Resumo Executivo (pt-BR)
+
+- **Objetivo:** medir e certificar o desempenho do motor contra os objetivos do projeto, polir as bordas de estabilidade e deixar um gate de CI que impeça regressões de desempenho e de tipos.
+- **Entregáveis:** `scripts/benchmark.mjs` completo (add-only, cancel-heavy, mixed match, market burst) com métricas por cenário (ordens/segundo, match latency p50/p99/p99.9 e memória de pico) e saída tabular + JSON (`bench-results.json`); job `benchmark` em `.github/workflows/ci.yml`, que falha se o throughput cair mais de 15% em relação à baseline registrada; `docs/PERFORMANCE.md`.
+- **Objetivos de baseline:** throughput ≥ 50.000 ordens/seg, match latency p99 ≤ 2 ms, L2 broadcast p99 ≤ 10 ms e replay de 1M eventos ≤ 30 s. Se o hardware local não alcançar o objetivo, documentar o delta e a baseline real (sem falsear números).
+- **Critérios de aceite:** `npm run bench` reproduzível com resultados em JSON; CI verde completo (typecheck + lint + tests + benchmark); documentação de performance publicada com baseline; PR de fechamento para `main` com revisão de arquitetura aprovada.
+- **Verificação:** `npx tsc --noEmit`, `npm run lint`, `npm test` e `npm run bench -- --orders 100000`.
+- **Status:** 🔒 spec congelada (frozen). Risco em aberto: `better-sqlite3` síncrono pode ser o gargalo do WAL; avaliar batch-writes e documentar o trade-off.
+
 ## 1. Objetivo
 
 Medir y certificar el rendimiento del motor contra los objetivos del proyecto,

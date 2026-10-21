@@ -7,6 +7,15 @@
 | Rama sugerida | `sprint/01-matching-engine` |
 | Propietario | ⚛️ nextjs-dev + 🧪 qa-tester |
 
+## Resumo Executivo (pt-BR)
+
+- **Objetivo:** implementar o matching engine em memória com prioridade Preço-Tempo, suporte a `LIMIT`/`MARKET`/`CANCEL` e Time-in-Force `GTC`/`IOC`, emitindo eventos imutáveis que serão a base do WAL (Sprint 02).
+- **Entregáveis:** `events.ts`, `matcher.ts`, `processor.ts` e `policies.ts` em `src/engine/`. A entrega efetiva concentrou-se em `src/engine/matching.ts` (classe `MatchingEngine`), conforme registra a §7.
+- **Critérios de aceite:** cruzamento parcial, total e multi-nível; `MARKET` sem liquidez → rejeição; `IOC` com resto → descarte; `CANCEL` de ordem inexistente → rejeição idempotente; self-trade prevention (mesmo `traderId` não cruza consigo mesmo).
+- **Propriedade de determinismo:** o estado do livro após N operações deve ser idêntico ao de um replay dos eventos; `tsc --noEmit` limpo e sem `any` na superfície pública do motor.
+- **Verificação:** `npx tsc --noEmit`, `npm run lint` e `npm test -- engine`.
+- **Status:** 🔒 spec congelada (frozen). Emendas da §7: eventos de domínio, pipeline `processor.ts`/`policies.ts` e self-trade prevention diferidos ao Sprint 02; `DoublyLinkedList.fill(node, qty)` como fonte única de volume; índice de níveis `Map` + array ordenado com dívida de `splice` documentada.
+
 ## 1. Objetivo
 
 Implementar el motor de calce en memoria que procesa órdenes entrantes contra el

@@ -1,21 +1,52 @@
 # orderbook-engine
 
-**High-Throughput In-Memory Orderbook & Matching Engine**
+**Motor de matching in-memory de alta performance, com WAL auditável e ledger de dupla entrada.**
 
-> ⚠️ **Estado / Status:** Scaffolding inicial — hoja de ruta congelada, implementación pendiente.
-> Initial scaffolding — roadmap frozen, implementation pending.
-
----
-
-## Descripción / Description
-
-**EN** — An in-memory order matching engine with strict Price-Time Priority, built in TypeScript. Orders (LIMIT, MARKET, CANCEL with GTC and IOC time-in-force) are matched against an in-memory order book, persisted through an append-only WAL with Event Sourcing over SQLite (better-sqlite3) for deterministic state replay on boot, and settled through a double-entry ledger with atomic Maker/Taker fund reservation. It exposes L2/L3 market data streaming (SSE/WebSocket) and ships with a benchmark suite (orders/sec and p99 latency).
-
-**ES** — Motor de calce (matching) de órdenes en memoria con prioridad estricta Precio-Tiempo, construido en TypeScript. Las órdenes (LIMIT, MARKET, CANCEL con Time-in-Force GTC e IOC) se calzan contra un libro de órdenes en memoria, se persisten mediante un WAL append-only con Event Sourcing sobre SQLite (better-sqlite3) para reconstrucción determinista del estado en el arranque, y se liquidan a través de un ledger de doble entrada con reserva atómica de fondos Maker/Taker. Expone streaming de datos de mercado L2/L3 (SSE/WebSocket) e incluye una suite de benchmarks (órdenes/segundo y latencia p99).
+> **Status (pt-BR):** implementado e verificado em 2026-10-21 pelas suítes `test-sprint-00` … `test-sprint-04`, incluindo `test-sprint-02-hardening` e `test-sprint-03-hardening`.
+>
+> **Performance:** baseline real de **127 ord/s** em 100.000 ordens (Intel Core i3-7100U, 4 threads, 2026-10-18). A meta de ≥50.000 ord/s **não foi atingida**; números completos e análise do gargalo em [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
+>
+> **Status (EN):** implemented and verified on 2026-10-21 by the `test-sprint-00` … `test-sprint-04` suites. Real baseline: **127 orders/sec** at 100k; the ≥50,000 orders/sec target was **not met** (see [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)).
 
 ---
 
-## Flujo de eventos / Event flow
+## Português (Brasil)
+
+Motor de matching de ordens escrito em TypeScript, com o livro de ofertas inteiramente em memória. Cada comando (LIMIT, MARKET e CANCEL, com GTC/IOC) é casado em memória, persistido em um WAL append-only com event sourcing sobre SQLite e liquidado por um ledger de dupla entrada na mesma transação. O estado é reconstruído no boot por replay determinístico (snapshot ancorado + delta do WAL), e os dados de mercado L2 são publicados por streaming SSE.
+
+### Por que para o mercado brasileiro?
+
+- **Matching in-memory com prioridade preço-tempo:** melhor preço e cancelamento em O(1) (ponteiros para os extremos e índice `orderId → nó`); filas FIFO por nível em O(1); inserção de nível com busca binária em O(log N) no array ordenado de preços (o deslocamento do array é O(L) ao criar ou remover o nível).
+- **Ledger de dupla entrada com garantias ACID:** uma transação SQLite por comando, com rollback total (SQL e estado em RAM), invariante Σ débitos = Σ créditos por transação e por asset, e imutabilidade por triggers que abortam `UPDATE`/`DELETE` em `journal_entries` e `settled_trades`.
+- **WAL com hash chain SHA-256 por evento e snapshot ancorado** (`state_hash` + `wal_anchor_hash`): trilha de auditoria verificável no replay — base para auditoria e integração regulatória brasileira. O projeto **não** alega certificação regulatória.
+- **Ativos configuráveis por string, incluindo BRL:** base e quote são definidos na configuração do `SettlementLedger`. Os fixtures e testes atuais usam BTC/USD.
+
+### Quick start
+
+```bash
+npm install
+npm run dev                          # Next.js em localhost
+npm test                             # 7 suítes de validação (00 … 04 + hardening)
+npm run bench -- --orders 100000     # benchmark standalone (GC exposto pelo script)
+```
+
+Requer Node.js 22 (versão usada no CI). A base SQLite é local e o servidor faz bind em `127.0.0.1` por padrão.
+
+### Documentação
+
+- [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) — arquitetura, complexidade, WAL/event sourcing, ledger e streaming.
+- [`docs/SECURITY.md`](./docs/SECURITY.md) — integridade do WAL, determinismo, validação e hardening.
+- [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md) — baseline real e análise do gargalo.
+
+---
+
+## English
+
+### Overview
+
+An in-memory order matching engine built in TypeScript with strict price-time priority. LIMIT, MARKET and CANCEL orders (GTC/IOC) are matched in memory, persisted to an append-only WAL using event sourcing over SQLite (`better-sqlite3`) in the same transaction as the double-entry settlement, and replayed deterministically on boot from an anchored snapshot plus the WAL delta. L2 market data (depth snapshot, depth updates and trades) is published over SSE. The repository also ships a standalone benchmark suite.
+
+### Event flow
 
 ```mermaid
 flowchart TD
@@ -32,117 +63,113 @@ flowchart TD
     WAL_C --> BC_C["L2 Broadcast"]
 ```
 
-**Leyenda / Legend**
+**Legend**
 
-| Rama / Branch | Eventos emitidos / Events emitted |
+| Branch | Events written to the WAL |
 |---|---|
-| Cruce (`Ingress Order → In-Memory Match → WAL Append → Ledger Settle → L2 Broadcast`) | `order_matched`, `funds_reserved`, `funds_settled` |
-| No-cruce (`Ingress Order → Order Book Insert → WAL Append → L2 Broadcast`) | `order_placed` |
-| Cancelación (`Ingress Cancel → Order Book Remove → WAL Append → L2 Broadcast`) | `order_cancelled` |
+| Cross (`Ingress Order → In-Memory Match → WAL Append → Ledger Settle → L2 Broadcast`) | `ORDER_NEW` + one `TRADE_MATCH` per trade |
+| No cross (`Ingress Order → Order Book Insert → WAL Append → L2 Broadcast`) | `ORDER_NEW` (resting order) |
+| Cancel (`Ingress Cancel → Order Book Remove → WAL Append → L2 Broadcast`) | `ORDER_CANCEL` |
 
 ---
 
-## Benchmarks objetivo / Target benchmarks
+### Benchmark targets vs real baseline
 
-| Métrica / Metric | Objetivo / Target | Validación / Validation |
+Measured on 2026-10-18 (Intel Core i3-7100U, 4 threads, Node 24.12.0, better-sqlite3 12.11.1). Methodology and bottleneck analysis: [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
+
+| Metric | Target | Measured | Verdict |
+|---|---|---|---|
+| Throughput | ≥ 50,000 orders/sec | 127 orders/sec @100k · 174 orders/sec @20k | ❌ Not met |
+| Match latency p99 | ≤ 2 ms | 17.172 ms @100k · 12.575 ms @20k (end-to-end; matching not isolated) | ❌ Not certifiable |
+| L2 broadcast latency p99 | ≤ 10 ms | not measured | ⚠️ Not verified |
+| State replay (1M events) | ≤ 30 s | not measured | ⚠️ Not verified |
+
+---
+
+### Tech stack
+
+Versions are declared in `package.json` (caret ranges).
+
+| Piece | Version | Purpose |
 |---|---|---|
-| Throughput | ≥ 50,000 orders/sec | SPRINT_05 |
-| Match latency (p99) | ≤ 2 ms | SPRINT_05 |
-| L2 broadcast latency (p99) | ≤ 10 ms | SPRINT_05 |
-| State replay (1M events) | ≤ 30 s | SPRINT_05 |
+| Next.js | ^16.0.0 (App Router) | Application server, API and streaming routes |
+| React / React DOM | ^19.2.0 | Dashboard UI (Next.js peer) |
+| TypeScript | ^5.9.0 (`strict`) | Language and strict type checking |
+| Tailwind CSS | ^4.0.0 (`@tailwindcss/postcss`) | Dashboard styling |
+| better-sqlite3 | ^12.0.0 (`@types/better-sqlite3` ^7.6.11) | WAL/event store, snapshots and ledger on SQLite |
+| tsx | ^4.19.0 | Standalone engine and benchmark execution |
+| ESLint | ^9.0.0 (flat config, `eslint-config-next` ^16.0.0) | Linting |
+| Node.js | 22 (CI runtime) | Runtime |
 
-*ES:* ≥ 50.000 órdenes/seg; latencia de match p99 ≤ 2 ms; latencia de broadcast L2 p99 ≤ 10 ms; replay de estado con 1M de eventos ≤ 30 s.
-
----
-
-## Tech stack
-
-> Nota: las versiones exactas (parches) quedan fijadas en `package.json`; esta tabla refleja las dependencias verificadas contra `package.json` del scaffolding.
-
-| Pieza / Piece | Versión / Version | Uso / Purpose |
-|---|---|---|
-| Next.js | 16.x (App Router) | Servidor de aplicación, rutas de API de ingress y streaming |
-| React / React DOM | 19.2.x | Framework UI del panel de visualización (peer de Next.js 16) |
-| TypeScript | 5.9.x (`strict`) | Lenguaje, verificación estricta de tipos |
-| Tailwind CSS | 4.x (`@tailwindcss/postcss`) | Estilos del panel de visualización |
-| better-sqlite3 | 12.x (`@types/better-sqlite3` 7.6.x) | WAL / Event Store y ledger sobre SQLite |
-| drizzle-orm | 0.44.x | Capa de acceso tipada a SQLite |
-| zod | 4.x | Validación de entrada en el límite de la API y de payloads de eventos |
-| tsx | 4.19.x | Ejecución standalone del motor y de la suite de benchmarks |
-| ESLint | 9.x (flat config, `eslint-config-next` 16.x) | Linting del proyecto |
-| Node.js | ≥ 22 LTS (24 LTS recomendado) | Runtime |
+Declared in `package.json` but not imported by `src/` at this commit: `drizzle-orm` ^0.44.0 and `zod` ^4.0.0. The storage layer talks to SQLite directly through `better-sqlite3`.
 
 ---
 
-## Estructura del repositorio / Repository structure
+### Repository structure
 
-```
+```text
 orderbook-engine/
-├── README.md
 ├── package.json
-├── tsconfig.json                # strict: true, noEmit, paths @/* → src/*
+├── package-lock.json
+├── tsconfig.json                # strict, noEmit, @/* → src/*
 ├── next.config.ts               # serverExternalPackages: ["better-sqlite3"]
-├── next-env.d.ts
-├── eslint.config.mjs            # ESLint 9 flat config (core-web-vitals + typescript)
-├── postcss.config.mjs           # Tailwind v4
-├── .github/
-│   └── workflows/
-│       └── ci.yml               # Pipeline CI (gate del proyecto)
+├── eslint.config.mjs            # ESLint 9 flat config
+├── postcss.config.mjs
+├── bench-results.json           # local benchmark output (gitignored)
+├── .github/workflows/ci.yml     # CI pipeline
 ├── scripts/
-│   └── benchmark.mjs            # Entrypoint de benchmarks (placeholder hasta SPRINT_05)
+│   ├── benchmark.mjs            # standalone benchmark entrypoint
+│   └── test-sprint-*.mjs        # 7 validation suites (00…04 + 02/03 hardening)
 ├── docs/
-│   ├── ARCHITECTURE.md          # Arquitectura, complejidad, WAL, ledger, streaming
-│   ├── SECURITY.md              # Seguridad y checklist por sprint
-│   └── testing/                 # (reservado) instrucciones de testeo por sprint
-├── sprints/                     # Hoja de ruta congelada (README + 6 archivos de sprint)
+│   ├── ARCHITECTURE.md
+│   ├── PERFORMANCE.md
+│   ├── SECURITY.md
+│   └── testing/                 # reserved for per-cycle test instructions
+├── sprints/
 │   ├── README.md
-│   ├── SPRINT_00_SETUP_AND_CORE_DATA_STRUCTURES.md
-│   ├── SPRINT_01_MATCHING_ENGINE_CORE.md
-│   ├── SPRINT_02_WAL_PERSISTENCE_AND_STATE_REPLAY.md
-│   ├── SPRINT_03_DOUBLE_ENTRY_SETTLEMENT_LEDGER.md
-│   ├── SPRINT_04_L2_ORDERBOOK_STREAMING_API.md
-│   └── SPRINT_05_BENCHMARK_SUITE_POLISH_AND_CI.md
-└── src/                         # Placeholders por dominio (implementación por sprint)
-    ├── core/                    # Estructuras del libro: niveles de precio, colas FIFO, sequence
-    ├── engine/                  # Motor de matching: intake, reglas de cruce, ejecución
-    ├── storage/                 # WAL / Event Store (SQLite + drizzle)
-    ├── ledger/                  # Ledger de doble entrada
-    ├── api/                     # Rutas de ingress (Next.js)
-    └── app/                     # App Router: layout y página de visualización
+│   ├── orderbook-engine.code-workspace
+│   └── SPRINT_00 … SPRINT_05 (6 spec files)
+└── src/
+    ├── core/                    # price levels, FIFO queues, domain types
+    ├── engine/                  # matching engine + atomic execution pipeline
+    ├── storage/                 # SQLite schema, WAL hash chain, snapshots, replay
+    ├── ledger/                  # accounts + double-entry settlement
+    ├── api/                     # BigInt-safe DTOs, L2 depth, SSE server
+    └── app/                     # Next.js App Router
 ```
 
 ---
 
-## Scripts
+### Scripts
 
-| Script | Comando | Descripción |
+| Script | Command | Description |
 |---|---|---|
-| `dev` | `next dev` | Servidor de desarrollo con HMR en `localhost`. |
-| `build` | `next build` | Build de producción del app router. |
-| `start` | `next start` | Sirve el build de producción, bind a `localhost` por defecto. |
-| `lint` | `eslint .` | Linting del proyecto con ESLint 9 (config flat de Next 16). |
-| `tsc` | `tsc --noEmit` | Verificación de tipos estricta, sin emitir. |
-| `test` | `npm test` | Encadena las 7 suites de validación: `test-sprint-00`, `01`, `02`, `02-hardening`, `03`, `03-hardening` y `04`. |
-| `bench` | `node --expose-gc scripts/benchmark.mjs` | Entrypoint de la suite de benchmarks standalone (órdenes/seg, p99, replay de 1M eventos) sin arrancar Next.js; placeholder que se implementa por completo en SPRINT_05. |
+| `dev` | `next dev` | Development server on `localhost`. |
+| `build` | `next build` | Production build of the App Router. |
+| `start` | `next start` | Serves the production build; binds to localhost by default. |
+| `lint` | `eslint .` | Project linting with ESLint 9 (Next 16 flat config). |
+| `tsc` | `tsc --noEmit` | Strict type check, no emit. |
+| `test` | `npm test` | Chains the 7 validation suites: `test-sprint-00`, `01`, `02`, `02-hardening`, `03`, `03-hardening` and `04`. |
+| `bench` | `node --expose-gc scripts/benchmark.mjs` | Standalone benchmark. Flags: `--orders` (default 100,000) and `--users` (default 10,000). Writes `bench-results.json`. |
 
 ---
 
-## Roadmap
+### Roadmap
 
-> La hoja de ruta autoritativa y detallada está en [`sprints/README.md`](./sprints/README.md). Los objetivos intermedios de esta tabla derivan del alcance del proyecto.
+Authoritative sprint specs: [`sprints/README.md`](./sprints/README.md).
 
-| Sprint | Nombre | Foco |
+| Sprint | Focus | Status |
 |---|---|---|
-| SPRINT_00 | Setup & Core Data Structures | Scaffolding, config estricta, estructuras del libro (niveles de precio, colas FIFO, sequence). |
-| SPRINT_01 | Matching Engine Core | Calce Precio-Tiempo para LIMIT / MARKET / CANCEL con GTC e IOC. |
-| SPRINT_02 | WAL Persistence & State Replay | Event log append-only, checksums, snapshot + compaction, replay determinista. |
-| SPRINT_03 | Double-Entry Settlement Ledger | Reserva Maker/Taker, liquidación atómica, rollback. |
-| SPRINT_04 | L2 Orderbook Streaming API | Snapshot + deltas vía SSE/WebSocket, reconciliación, backpressure. |
-| SPRINT_05 | Benchmark Suite, Polish & CI | Benchmarks objetivo, afinado y pipeline CI. |
+| SPRINT_00 | Setup and core data structures (price levels, FIFO queues, sequence) | Implemented and verified |
+| SPRINT_01 | Matching engine core: price-time priority for LIMIT / MARKET / CANCEL with GTC/IOC | Implemented and verified |
+| SPRINT_02 | WAL persistence and deterministic replay (+ 02.5 hash chain and snapshot hardening) | Implemented and verified |
+| SPRINT_03 | Double-entry settlement ledger (+ 03.5 snapshot anchoring and pipeline atomicity) | Implemented and verified |
+| SPRINT_04 | L2 orderbook streaming API (SSE snapshot + deltas + trades) | Implemented and verified |
+| SPRINT_05 | Benchmark suite, polish and CI | Benchmark implemented; performance targets not met; CI performance gate not implemented |
 
----
+### Documentation
 
-## Documentación
-
-- [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) — arquitectura, análisis de complejidad, WAL/Event Sourcing, ledger y streaming.
-- [`docs/SECURITY.md`](./docs/SECURITY.md) — integridad del WAL, determinismo, validación, aislamiento y checklist de seguridad por sprint.
+- [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) — architecture, complexity analysis, WAL/event sourcing, ledger and streaming.
+- [`docs/SECURITY.md`](./docs/SECURITY.md) — WAL integrity, determinism, validation, local isolation and ledger hardening.
+- [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md) — real baseline, bottleneck analysis and CI gate status.
+- [`sprints/README.md`](./sprints/README.md) — sprint roadmap and specifications.
